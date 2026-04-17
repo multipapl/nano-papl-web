@@ -4,7 +4,7 @@ import { useState, useMemo, Fragment, useRef, useEffect, useCallback } from "rea
 import {
     MessageSquare,
     Layers,
-    Image,
+    Image as ImageIcon,
     Settings,
     ChevronDown,
     Send,
@@ -23,9 +23,7 @@ import {
     Sparkles,
     FolderOpen,
     ChevronRight,
-    Grid3X3,
     LayoutGrid,
-    List,
     Star,
     MoreVertical,
     FolderPlus,
@@ -47,6 +45,20 @@ import {
     DEFAULT_MODEL,
     type GeminiConfig,
 } from "@/lib/gemini";
+import { sendFalMessage, type FalChatConfig } from "@/lib/fal";
+import {
+    PROVIDERS,
+    getModel,
+    getModelLabel,
+    withModelName,
+} from "@/lib/providers/registry";
+import {
+    getProviderSelection,
+    setProviderSelection,
+    getApiKeyForProvider,
+    hasApiKeyForProvider,
+} from "@/lib/providers/provider-config";
+import type { ProviderSlug } from "@/lib/providers/types";
 import {
     saveImage,
     loadImages,
@@ -68,15 +80,61 @@ import {
 } from "@/lib/image-db";
 import { clearAllLocalStorage, getLocalStorageSize } from "@/lib/storage";
 import { BatchPage } from "@/components/batch/batch-page";
+import { Tooltip } from "@/components/ui/tooltip";
+import { APP_VERSION } from "@/lib/app-version";
 
 const tabs = [
     { id: "chat", label: "Chat", icon: MessageSquare },
     { id: "batch", label: "Batch", icon: Layers },
-    { id: "gallery", label: "Gallery", icon: Image },
+    { id: "gallery", label: "Gallery", icon: ImageIcon },
     { id: "settings", label: "Settings", icon: Settings },
 ] as const;
 
 type TabId = (typeof tabs)[number]["id"];
+const CHAT_FOLDERS_KEY = "chat_folders";
+const CHAT_GALLERY_FOLDER_KEY = "chat_gallery_default_folder";
+const GALLERY_CUSTOM_FOLDERS_KEY = "gallery_custom_folders";
+const GALLERY_FOLDERS_CHANGED_EVENT = "nanopapl:gallery-folders-changed";
+
+function readStringListSetting(name: string): string[] {
+    try {
+        const raw = storage.get(name);
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string" && v.trim().length > 0) : [];
+    } catch {
+        return [];
+    }
+}
+
+function writeStringListSetting(name: string, values: string[]): void {
+    storage.set(name, JSON.stringify(Array.from(new Set(values.map(v => v.trim()).filter(Boolean)))));
+}
+
+function notifyGalleryFoldersChanged(): void {
+    window.dispatchEvent(new CustomEvent(GALLERY_FOLDERS_CHANGED_EVENT));
+}
+
+type CapabilityBadgeType = "IMG2IMG" | "TXT2IMG" | "CHAT";
+
+const CAPABILITY_LABELS: Record<CapabilityBadgeType, string> = {
+    IMG2IMG: "Can use an existing image as input and transform it.",
+    TXT2IMG: "Can generate an image from text only.",
+    CHAT: "Can answer chat messages, not only generate images.",
+};
+
+const CAPABILITY_CLASSES: Record<CapabilityBadgeType, string> = {
+    IMG2IMG: "text-accent/70 bg-accent/10",
+    TXT2IMG: "text-green-400/70 bg-green-400/10",
+    CHAT: "text-blue-400/70 bg-blue-400/10",
+};
+
+function CapabilityBadge({ type }: { type: CapabilityBadgeType }) {
+    return (
+        <Tooltip label={CAPABILITY_LABELS[type]}>
+            <span className={`text-[9px] px-1.5 py-0.5 rounded ${CAPABILITY_CLASSES[type]}`}>{type}</span>
+        </Tooltip>
+    );
+}
 
 /* ═══ (Constructor templates and state moved to components/batch/) ═══ */
 
@@ -84,7 +142,7 @@ type TabId = (typeof tabs)[number]["id"];
 /* ═══ APP SHELL                                  ═══ */
 /* ═══════════════════════════════════════════════════ */
 
-export function AppShell({ children }: { children: React.ReactNode }) {
+export function AppShell() {
     const [activeTab, setActiveTab] = useState<TabId>("chat");
     const [direction, setDirection] = useState<"left" | "right">("right");
     const prevTabRef = useRef<TabId>("chat");
@@ -107,12 +165,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                     const Icon = tab.icon;
                     const isActive = activeTab === tab.id;
                     return (
-                        <button key={tab.id} onClick={() => handleTabChange(tab.id)}
-                            className={`flex flex-col items-center gap-0.5 px-6 py-1.5 rounded-lg transition-all duration-200 cursor-pointer relative
-                                ${isActive ? "text-accent" : "text-muted-foreground hover:text-foreground"}`}>
-                            <Icon size={20} strokeWidth={isActive ? 2.2 : 1.5} className="transition-all duration-200" />
-                            <span className="text-[10px] font-medium transition-all duration-200">{tab.label}</span>
-                        </button>
+                        <Tooltip key={tab.id} label={`Open ${tab.label}.`} side="top">
+                            <button onClick={() => handleTabChange(tab.id)}
+                                className={`flex flex-col items-center gap-0.5 px-6 py-1.5 rounded-lg transition-all duration-200 cursor-pointer relative
+                                    ${isActive ? "text-accent" : "text-muted-foreground hover:text-foreground"}`}>
+                                <Icon size={20} strokeWidth={isActive ? 2.2 : 1.5} className="transition-all duration-200" />
+                                <span className="text-[10px] font-medium transition-all duration-200">{tab.label}</span>
+                            </button>
+                        </Tooltip>
                     );
                 })}
             </nav>
@@ -128,9 +188,9 @@ function AnimatedTabContent({ activeTab, direction }: { activeTab: TabId; direct
 
     useEffect(() => {
         if (activeTab !== displayedTab) {
-            setIsAnimating(true);
+            const startTimer = setTimeout(() => setIsAnimating(true), 0);
             const timer = setTimeout(() => { setDisplayedTab(activeTab); setIsAnimating(false); }, 150);
-            return () => clearTimeout(timer);
+            return () => { clearTimeout(startTimer); clearTimeout(timer); };
         }
     }, [activeTab, displayedTab]);
 
@@ -213,21 +273,43 @@ function ChatPage() {
     const [attachedImage, setAttachedImage] = useState<string | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [activeProvider, setActiveProvider] = useState<ProviderSlug>("gemini");
     const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODEL);
     const [showModelPicker, setShowModelPicker] = useState(false);
     const [hasApiKey, setHasApiKey] = useState(false);
     const [genImage, setGenImage] = useState(true);
-    const [resolution, setResolution] = useState<string>("1K");
+    const [resolution, setResolution] = useState<string>("2K");
     const [aspectRatio, setAspectRatio] = useState<string>("16:9");
     const [showRatioPicker, setShowRatioPicker] = useState(false);
     const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const abortRef = useRef(false);
+    const [chatFolders, setChatFolders] = useState<string[]>([]);
+    const [expandedChatFolders, setExpandedChatFolders] = useState<Set<string>>(new Set(["Ungrouped"]));
+    const [dragChatId, setDragChatId] = useState<string | null>(null);
+    const [galleryFolders, setGalleryFolders] = useState<string[]>([]);
+    const [chatGalleryFolder, setChatGalleryFolder] = useState("");
+
+    const refreshGalleryFolders = useCallback(async () => {
+        const custom = readStringListSetting(GALLERY_CUSTOM_FOLDERS_KEY);
+        try {
+            const galleryItems = await loadGalleryItems();
+            const fromItems = galleryItems.map(item => item.folder).filter(Boolean) as string[];
+            setGalleryFolders(Array.from(new Set([...custom, ...fromItems])).sort());
+        } catch {
+            setGalleryFolders(custom.sort());
+        }
+    }, []);
 
     // Load sessions from localStorage and hydrate images from IndexedDB on mount
     useEffect(() => {
         const saved = storage.getChatHistory();
+        const folders = readStringListSetting(CHAT_FOLDERS_KEY);
+        setChatFolders(folders);
+        setExpandedChatFolders(new Set(["Ungrouped", ...folders]));
+        setChatGalleryFolder(storage.get(CHAT_GALLERY_FOLDER_KEY) || "");
+        refreshGalleryFolders();
         if (saved.length > 0) {
             setSessions(saved);
             setActiveSessionId(saved[0].id);
@@ -250,8 +332,22 @@ function ChatPage() {
                 }).catch(err => console.warn("Failed to load images from IndexedDB:", err));
             }
         }
-        setHasApiKey(!!storage.getGeminiKey());
-    }, []);
+        // Load provider selection
+        const selection = getProviderSelection();
+        setActiveProvider(selection.provider);
+        setSelectedModel(selection.modelId);
+        setHasApiKey(hasApiKeyForProvider(selection.provider));
+    }, [refreshGalleryFolders]);
+
+    useEffect(() => {
+        const handler = () => refreshGalleryFolders();
+        window.addEventListener(GALLERY_CHANGED_EVENT, handler);
+        window.addEventListener(GALLERY_FOLDERS_CHANGED_EVENT, handler);
+        return () => {
+            window.removeEventListener(GALLERY_CHANGED_EVENT, handler);
+            window.removeEventListener(GALLERY_FOLDERS_CHANGED_EVENT, handler);
+        };
+    }, [refreshGalleryFolders]);
 
     // Auto-scroll to bottom when messages change
     useEffect(() => {
@@ -277,7 +373,6 @@ function ChatPage() {
         // Clean up images from IndexedDB for deleted session
         const session = sessions.find(s => s.id === id);
         if (session) {
-            const imgIds = session.messages.filter(m => m.imageData && m.imageData !== "[image]").map(m => m.id);
             // Also include "[image]" markers (persisted in IndexedDB but not yet hydrated)
             const allImgIds = session.messages.filter(m => m.imageData).map(m => m.id);
             deleteImages(allImgIds).catch(err => console.warn("Failed to delete images from IndexedDB:", err));
@@ -289,12 +384,83 @@ function ChatPage() {
         }
     };
 
+    const handleCreateChatFolder = () => {
+        const name = prompt("New chat folder name:");
+        const trimmed = name?.trim();
+        if (!trimmed || chatFolders.includes(trimmed)) return;
+        const next = [...chatFolders, trimmed].sort();
+        setChatFolders(next);
+        setExpandedChatFolders(prev => new Set([...prev, trimmed]));
+        writeStringListSetting(CHAT_FOLDERS_KEY, next);
+    };
+
+    const moveChatToFolder = useCallback((chatId: string, folder?: string) => {
+        const updated = sessions.map(s => s.id === chatId ? { ...s, folder, updatedAt: Date.now() } : s);
+        persistSessions(updated);
+    }, [sessions, persistSessions]);
+
+    const handleRenameChatFolder = (oldName: string) => {
+        const name = prompt(`Rename chat folder "${oldName}":`, oldName);
+        const trimmed = name?.trim();
+        if (!trimmed || trimmed === oldName || chatFolders.includes(trimmed)) return;
+        const nextFolders = chatFolders.map(f => f === oldName ? trimmed : f).sort();
+        setChatFolders(nextFolders);
+        writeStringListSetting(CHAT_FOLDERS_KEY, nextFolders);
+        setExpandedChatFolders(prev => {
+            const next = new Set(prev);
+            if (next.delete(oldName)) next.add(trimmed);
+            return next;
+        });
+        persistSessions(sessions.map(s => s.folder === oldName ? { ...s, folder: trimmed } : s));
+    };
+
+    const handleDeleteChatFolder = (folder: string) => {
+        if (!confirm(`Delete chat folder "${folder}"? Chats will move to Ungrouped.`)) return;
+        const nextFolders = chatFolders.filter(f => f !== folder);
+        setChatFolders(nextFolders);
+        writeStringListSetting(CHAT_FOLDERS_KEY, nextFolders);
+        persistSessions(sessions.map(s => s.folder === folder ? { ...s, folder: undefined } : s));
+    };
+
+    const toggleChatFolder = (folder: string) => {
+        setExpandedChatFolders(prev => {
+            const next = new Set(prev);
+            if (next.has(folder)) next.delete(folder); else next.add(folder);
+            return next;
+        });
+    };
+
+    const handleCreateGalleryFolderForChat = () => {
+        const name = prompt("New gallery folder name:");
+        const trimmed = name?.trim();
+        if (!trimmed) return;
+        const next = Array.from(new Set([...readStringListSetting(GALLERY_CUSTOM_FOLDERS_KEY), trimmed])).sort();
+        writeStringListSetting(GALLERY_CUSTOM_FOLDERS_KEY, next);
+        setGalleryFolders(prev => Array.from(new Set([...prev, trimmed])).sort());
+        setChatGalleryFolder(trimmed);
+        storage.set(CHAT_GALLERY_FOLDER_KEY, trimmed);
+        notifyGalleryFoldersChanged();
+    };
+
+    const chatFolderGroups = useMemo(() => {
+        const groups = new Map<string, ChatSession[]>();
+        for (const folder of chatFolders) groups.set(folder, []);
+        groups.set("Ungrouped", []);
+        for (const session of sessions) {
+            const folder = session.folder && chatFolders.includes(session.folder) ? session.folder : "Ungrouped";
+            if (!groups.has(folder)) groups.set(folder, []);
+            groups.get(folder)!.push(session);
+        }
+        return groups;
+    }, [sessions, chatFolders]);
+
     const handleSend = async () => {
         if ((!inputText.trim() && !attachedImage) || isLoading) return;
 
-        const apiKey = storage.getGeminiKey();
+        const apiKey = getApiKeyForProvider(activeProvider);
         if (!apiKey) {
-            setError("No Gemini API key. Go to Settings to add one.");
+            const providerName = activeProvider === "gemini" ? "Gemini" : "Fal.ai";
+            setError(`No ${providerName} API key. Go to Settings to add one.`);
             return;
         }
 
@@ -333,22 +499,37 @@ function ChatPage() {
         abortRef.current = false;
 
         try {
-            // If genImage is off, force flash model (text-only)
-            const effectiveModel = genImage ? selectedModel : GEMINI_MODELS.find(m => !m.supportsImages)?.id || selectedModel;
+            let response: { text: string; imageData?: string; error?: string };
+            let modelForOutput = selectedModel;
 
-            const config: GeminiConfig = {
-                model: effectiveModel,
-                resolution: resolution,
-                ratio: aspectRatio,
-            };
+            if (activeProvider === "fal") {
+                // Fal.ai path — no multi-turn chat, standalone generation
+                const falConfig: FalChatConfig = {
+                    model: selectedModel,
+                    resolution: resolution,
+                    ratio: aspectRatio,
+                };
+                response = await sendFalMessage(apiKey, messageText, messageImage, falConfig);
+            } else {
+                // Gemini path (default)
+                // If genImage is off, force flash model (text-only)
+                const effectiveModel = genImage ? selectedModel : GEMINI_MODELS.find(m => !m.supportsImages)?.id || selectedModel;
+                modelForOutput = effectiveModel;
 
-            const response = await sendGeminiMessage(
-                apiKey,
-                session.messages.slice(0, -1), // History (without the message we just added)
-                messageText,
-                messageImage,
-                config,
-            );
+                const config: GeminiConfig = {
+                    model: effectiveModel,
+                    resolution: resolution,
+                    ratio: aspectRatio,
+                };
+
+                response = await sendGeminiMessage(
+                    apiKey,
+                    session.messages.slice(0, -1),
+                    messageText,
+                    messageImage,
+                    config,
+                );
+            }
 
             if (abortRef.current) return;
 
@@ -376,7 +557,8 @@ function ChatPage() {
                 saveGalleryItem({
                     id: crypto.randomUUID(),
                     dataUrl: response.imageData,
-                    prompt: messageText || "Image generation",
+                    prompt: withModelName(messageText || "Image generation", modelForOutput),
+                    folder: chatGalleryFolder || undefined,
                     source: "chat",
                     sessionId: session!.id,
                     createdAt: Date.now(),
@@ -415,22 +597,93 @@ function ChatPage() {
             <div className="flex h-full p-6 gap-4">
                 {/* Sidebar */}
                 <aside className="w-52 flex flex-col gap-2 shrink-0">
-                    <button onClick={handleNewChat}
-                        className="w-full flex items-center justify-center gap-2 px-3 py-2 text-sm rounded-lg bg-accent text-white hover:bg-accent-hover transition-all duration-200 active:scale-[0.97]">
-                        <Plus size={14} /> New Chat
-                    </button>
-                    <div className="flex-1 overflow-y-auto flex flex-col gap-0.5">
-                        {sessions.map((s) => (
-                            <div key={s.id} className={`group flex items-center rounded-lg transition-all duration-150
-                                ${s.id === activeSessionId ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground"}`}>
-                                <button onClick={() => { setActiveSessionId(s.id); setError(null); }}
-                                    className="flex-1 text-left px-3 py-2 text-sm truncate">{s.title}</button>
-                                <button onClick={() => handleDeleteChat(s.id)}
-                                    className="px-2 py-2 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400 transition-all duration-200">
-                                    <Trash2 size={12} />
-                                </button>
-                            </div>
-                        ))}
+                    <div className="flex gap-2">
+                        <button onClick={handleNewChat}
+                            className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-sm rounded-lg bg-accent text-white hover:bg-accent-hover transition-all duration-200 active:scale-[0.97]">
+                            <Plus size={14} /> New Chat
+                        </button>
+                        <Tooltip label="Create a chat folder. Drag chats into folders to keep projects separate.">
+                            <button onClick={handleCreateChatFolder}
+                                className="px-2.5 h-full rounded-lg bg-muted text-muted-foreground hover:text-foreground hover:bg-card-hover transition-all duration-200"
+                                title="New chat folder">
+                                <FolderPlus size={14} />
+                            </button>
+                        </Tooltip>
+                    </div>
+                    <div className="flex-1 overflow-y-auto flex flex-col gap-1">
+                        {Array.from(chatFolderGroups.entries()).map(([folder, folderSessions]) => {
+                            if (folder === "Ungrouped" && folderSessions.length === 0 && chatFolders.length > 0) return null;
+                            const isExpanded = expandedChatFolders.has(folder);
+                            const isCustomFolder = folder !== "Ungrouped";
+                            const isDropTarget = dragChatId !== null;
+
+                            return (
+                                <div key={folder}
+                                    className={`rounded-lg border transition-all duration-150 ${isDropTarget ? "border-accent/20" : "border-transparent"}`}
+                                    onDragOver={(e) => { e.preventDefault(); }}
+                                    onDrop={(e) => {
+                                        e.preventDefault();
+                                        const chatId = dragChatId || e.dataTransfer.getData("text/plain");
+                                        if (chatId) moveChatToFolder(chatId, isCustomFolder ? folder : undefined);
+                                        setDragChatId(null);
+                                    }}>
+                                    <div className="group flex items-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors">
+                                        <button onClick={() => toggleChatFolder(folder)}
+                                            className="flex-1 flex items-center gap-2 min-w-0 px-2 py-1.5 text-left">
+                                            <ChevronRight size={12}
+                                                className={`shrink-0 transition-transform duration-200 ${isExpanded ? "rotate-90" : ""}`} />
+                                            <FolderOpen size={13} className="shrink-0 text-accent/70" />
+                                            <span className="text-[11px] font-medium truncate">{folder}</span>
+                                            <span className="ml-auto text-[9px] text-muted-foreground/60">{folderSessions.length}</span>
+                                        </button>
+                                        {isCustomFolder && (
+                                            <div className="flex opacity-0 group-hover:opacity-100 transition-opacity">
+                                                <Tooltip label="Rename this chat folder.">
+                                                    <button onClick={() => handleRenameChatFolder(folder)}
+                                                        className="px-1.5 py-1.5 hover:text-foreground" title="Rename folder">
+                                                        <MoreVertical size={10} />
+                                                    </button>
+                                                </Tooltip>
+                                                <Tooltip label="Delete the folder. Chats inside move back to Ungrouped.">
+                                                    <button onClick={() => handleDeleteChatFolder(folder)}
+                                                        className="px-1.5 py-1.5 hover:text-red-400" title="Delete folder">
+                                                        <Trash2 size={10} />
+                                                    </button>
+                                                </Tooltip>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {isExpanded && (
+                                        <div className="flex flex-col gap-0.5 pl-3">
+                                            {folderSessions.map((s) => (
+                                                <div key={s.id}
+                                                    draggable
+                                                    onDragStart={(e) => {
+                                                        setDragChatId(s.id);
+                                                        e.dataTransfer.setData("text/plain", s.id);
+                                                        e.dataTransfer.effectAllowed = "move";
+                                                    }}
+                                                    onDragEnd={() => setDragChatId(null)}
+                                                    className={`group flex items-center rounded-lg transition-all duration-150
+                                                        ${s.id === activeSessionId ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground"}
+                                                        ${dragChatId === s.id ? "opacity-50" : ""}`}>
+                                                    <button onClick={() => { setActiveSessionId(s.id); setError(null); }}
+                                                        className="flex-1 text-left px-3 py-2 text-sm truncate">{s.title}</button>
+                                                    <button onClick={() => handleDeleteChat(s.id)}
+                                                        className="px-2 py-2 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400 transition-all duration-200">
+                                                        <Trash2 size={12} />
+                                                    </button>
+                                                </div>
+                                            ))}
+                                            {folderSessions.length === 0 && (
+                                                <div className="px-3 py-2 text-[10px] text-muted-foreground/35">Drop chats here</div>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
                         {sessions.length === 0 && (
                             <p className="text-xs text-muted-foreground/40 text-center mt-8">No chats yet</p>
                         )}
@@ -495,50 +748,82 @@ function ChatPage() {
                                         onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
                                         className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/40" />
                                     <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileAttach} />
-                                    <button onClick={() => fileInputRef.current?.click()}
-                                        className="text-muted-foreground hover:text-foreground ml-2 transition-colors duration-200" title="Attach image">
-                                        <Paperclip size={18} />
-                                    </button>
+                                    <Tooltip label="Attach an image for the model to analyze or edit.">
+                                        <button onClick={() => fileInputRef.current?.click()}
+                                            className="text-muted-foreground hover:text-foreground ml-2 transition-colors duration-200" title="Attach image">
+                                            <Paperclip size={18} />
+                                        </button>
+                                    </Tooltip>
                                 </div>
                                 {isLoading ? (
-                                    <button onClick={handleStop} className="p-2.5 rounded-xl bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-all duration-200 active:scale-95" title="Stop">
-                                        <StopCircle size={16} />
-                                    </button>
+                                    <Tooltip label="Stop the current request. Already returned text or images stay in the chat.">
+                                        <button onClick={handleStop} className="p-2.5 rounded-xl bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-all duration-200 active:scale-95" title="Stop">
+                                            <StopCircle size={16} />
+                                        </button>
+                                    </Tooltip>
                                 ) : (
-                                    <button onClick={handleSend}
-                                        disabled={!inputText.trim() && !attachedImage}
-                                        className="p-2.5 rounded-xl bg-accent text-white hover:bg-accent-hover transition-all duration-200 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed">
-                                        <Send size={16} />
-                                    </button>
+                                    <Tooltip label={genImage ? "Send the prompt and generate an image." : "Send the message to chat."}>
+                                        <button onClick={handleSend}
+                                            disabled={!inputText.trim() && !attachedImage}
+                                            className="p-2.5 rounded-xl bg-accent text-white hover:bg-accent-hover transition-all duration-200 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed">
+                                            <Send size={16} />
+                                        </button>
+                                    </Tooltip>
                                 )}
                             </div>
                             {/* Toolbar: Gen Image toggle, Model, Resolution, Ratio */}
                             <div className="flex items-center gap-3 mt-2 px-1 relative">
                                 {/* Gen Image toggle */}
-                                <label className="flex items-center gap-1.5 cursor-pointer select-none">
-                                    <input type="checkbox" checked={genImage} onChange={(e) => setGenImage(e.target.checked)} className="rounded accent-accent w-3.5 h-3.5" />
-                                    <span className="text-xs text-muted-foreground">Gen Image</span>
-                                </label>
+                                <Tooltip label="Turn this on when the next message should create an image and save it to Gallery.">
+                                    <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                                        <input type="checkbox" checked={genImage} onChange={(e) => setGenImage(e.target.checked)} className="rounded accent-accent w-3.5 h-3.5" />
+                                        <span className="text-xs text-muted-foreground">Gen Image</span>
+                                    </label>
+                                </Tooltip>
 
                                 <span className="text-muted-foreground/20">|</span>
 
-                                {/* Model selector */}
+                                {/* Model selector with provider groups */}
                                 <div className="relative">
-                                    <button onClick={() => { setShowModelPicker(!showModelPicker); setShowRatioPicker(false); }}
-                                        className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-all duration-200">
-                                        <span className="text-muted-foreground/60">Model:</span>
-                                        <span className="font-medium">{GEMINI_MODELS.find((m) => m.id === selectedModel)?.label || selectedModel}</span>
-                                        <ChevronDown size={10} />
-                                    </button>
+                                    <Tooltip label="Choose which model answers this chat or creates the image. Models without a saved key are disabled.">
+                                        <button onClick={() => { setShowModelPicker(!showModelPicker); setShowRatioPicker(false); }}
+                                            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-all duration-200">
+                                            <span className="text-muted-foreground/60">Model:</span>
+                                            <span className="font-medium">{getModel(selectedModel)?.label || selectedModel}</span>
+                                            <ChevronDown size={10} />
+                                        </button>
+                                    </Tooltip>
                                     {showModelPicker && (
-                                        <div className="absolute bottom-full left-0 mb-2 bg-card border border-border rounded-xl shadow-xl py-1 min-w-[240px] z-50">
-                                            {GEMINI_MODELS.map((m) => (
-                                                <button key={m.id} onClick={() => { setSelectedModel(m.id); setShowModelPicker(false); }}
-                                                    className={`w-full text-left px-4 py-2 text-xs flex items-center justify-between transition-all duration-150
-                                                        ${m.id === selectedModel ? "bg-accent/10 text-accent" : "hover:bg-muted text-foreground"}`}>
-                                                    <span>{m.label}</span>
-                                                    {m.supportsImages && <span className="text-[9px] text-accent/60 bg-accent/10 px-1.5 py-0.5 rounded">IMG</span>}
-                                                </button>
+                                        <div className="absolute bottom-full left-0 mb-2 bg-card border border-border rounded-xl shadow-xl py-1 min-w-[280px] z-50 max-h-80 overflow-y-auto">
+                                            {PROVIDERS.map((provider) => (
+                                                <div key={provider.slug}>
+                                                    <div className="px-4 py-1.5 text-[9px] uppercase tracking-wider text-muted-foreground/50 font-medium border-b border-border/30">
+                                                        {provider.name}
+                                                        {!hasApiKeyForProvider(provider.slug) && (
+                                                            <span className="ml-1.5 text-yellow-500/60">⚠ no key</span>
+                                                        )}
+                                                    </div>
+                                                    {provider.models.map((m) => (
+                                                        <button key={m.id} onClick={() => {
+                                                            setActiveProvider(m.provider);
+                                                            setSelectedModel(m.id);
+                                                            setProviderSelection({ provider: m.provider, modelId: m.id });
+                                                            setHasApiKey(hasApiKeyForProvider(m.provider));
+                                                            setShowModelPicker(false);
+                                                        }}
+                                                            disabled={!hasApiKeyForProvider(provider.slug)}
+                                                            className={`w-full text-left px-4 py-2 text-xs flex items-center justify-between transition-all duration-150
+                                                                ${m.id === selectedModel ? "bg-accent/10 text-accent" : "hover:bg-muted text-foreground"}
+                                                                ${!hasApiKeyForProvider(provider.slug) ? "opacity-40 cursor-not-allowed" : ""}`}>
+                                                            <span>{m.label}</span>
+                                                            <span className="flex gap-1">
+                                                                {m.capabilities.imageToImage && <CapabilityBadge type="IMG2IMG" />}
+                                                                {m.capabilities.textToImage && <CapabilityBadge type="TXT2IMG" />}
+                                                                {m.capabilities.chat && <CapabilityBadge type="CHAT" />}
+                                                            </span>
+                                                        </button>
+                                                    ))}
+                                                </div>
                                             ))}
                                         </div>
                                     )}
@@ -550,11 +835,13 @@ function ChatPage() {
                                         <span className="text-muted-foreground/20">|</span>
                                         <div className="flex items-center gap-1">
                                             {RESOLUTIONS.map((r) => (
-                                                <button key={r} onClick={() => setResolution(r)}
-                                                    className={`px-2 py-0.5 text-[10px] rounded-md transition-all duration-150
-                                                        ${resolution === r ? "bg-accent/20 text-accent font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}>
-                                                    {r}
-                                                </button>
+                                                <Tooltip key={r} label={`${r} output tier. 2K is the default balance for this app.`}>
+                                                    <button onClick={() => setResolution(r)}
+                                                        className={`px-2 py-0.5 text-[10px] rounded-md transition-all duration-150
+                                                            ${resolution === r ? "bg-accent/20 text-accent font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}>
+                                                        {r}
+                                                    </button>
+                                                </Tooltip>
                                             ))}
                                         </div>
                                     </>
@@ -565,12 +852,14 @@ function ChatPage() {
                                     <>
                                         <span className="text-muted-foreground/20">|</span>
                                         <div className="relative">
-                                            <button onClick={() => { setShowRatioPicker(!showRatioPicker); setShowModelPicker(false); }}
-                                                className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-all duration-200">
-                                                <span className="text-muted-foreground/60">Ratio:</span>
-                                                <span className="font-medium">{aspectRatio}</span>
-                                                <ChevronDown size={10} />
-                                            </button>
+                                            <Tooltip label="Choose the image shape: square, vertical, wide, and so on.">
+                                                <button onClick={() => { setShowRatioPicker(!showRatioPicker); setShowModelPicker(false); }}
+                                                    className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-all duration-200">
+                                                    <span className="text-muted-foreground/60">Ratio:</span>
+                                                    <span className="font-medium">{aspectRatio}</span>
+                                                    <ChevronDown size={10} />
+                                                </button>
+                                            </Tooltip>
                                             {showRatioPicker && (
                                                 <div className="absolute bottom-full left-0 mb-2 bg-card border border-border rounded-xl shadow-xl py-1 min-w-[120px] z-50 max-h-60 overflow-y-auto">
                                                     {ASPECT_RATIOS.map((r) => (
@@ -586,9 +875,42 @@ function ChatPage() {
                                     </>
                                 )}
 
+                                {/* Gallery destination folder */}
+                                {genImage && (
+                                    <>
+                                        <span className="text-muted-foreground/20">|</span>
+                                        <div className="flex items-center gap-1.5">
+                                            <span className="text-xs text-muted-foreground/60">Save to:</span>
+                                            <Tooltip label="Generated chat images will be saved to this Gallery folder by default.">
+                                                <select
+                                                    value={chatGalleryFolder}
+                                                    onChange={(e) => {
+                                                        setChatGalleryFolder(e.target.value);
+                                                        storage.set(CHAT_GALLERY_FOLDER_KEY, e.target.value);
+                                                    }}
+                                                    className="max-w-32 bg-muted text-xs text-muted-foreground hover:text-foreground rounded-md px-2 py-0.5 outline-none"
+                                                    title="Default gallery folder for generated chat images"
+                                                >
+                                                    <option value="">Ungrouped</option>
+                                                    {galleryFolders.map(folder => (
+                                                        <option key={folder} value={folder}>{folder}</option>
+                                                    ))}
+                                                </select>
+                                            </Tooltip>
+                                            <Tooltip label="Create a new Gallery folder and use it for generated chat images.">
+                                                <button onClick={handleCreateGalleryFolderForChat}
+                                                    className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                                                    title="New gallery folder">
+                                                    <FolderPlus size={12} />
+                                                </button>
+                                            </Tooltip>
+                                        </div>
+                                    </>
+                                )}
+
                                 {/* API key warning */}
                                 {!hasApiKey && (
-                                    <span className="text-[10px] text-yellow-500/70">⚠ No API key set</span>
+                                    <span className="text-[10px] text-yellow-500/70">⚠ No {activeProvider === "gemini" ? "Gemini" : "Fal.ai"} API key</span>
                                 )}
                             </div>
                         </div>
@@ -645,6 +967,63 @@ function downloadBase64Image(dataUrl: string, filename: string) {
     } catch (err) {
         console.error("Download failed:", err);
     }
+}
+
+function getImageExtensionFromDataUrl(dataUrl: string): string {
+    const mimeMatch = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/);
+    const mimeType = mimeMatch ? mimeMatch[1] : "image/png";
+    const extMap: Record<string, string> = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    };
+    return extMap[mimeType] || ".png";
+}
+
+function getBase64Payload(dataUrl: string): string {
+    return dataUrl.split(",")[1] || "";
+}
+
+function safeFilename(name: string): string {
+    return (name || "image")
+        .replace(/[^a-zA-Z0-9_\-]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        || "image";
+}
+
+function uniquePath(path: string, used: Set<string>): string {
+    if (!used.has(path)) {
+        used.add(path);
+        return path;
+    }
+
+    const dot = path.lastIndexOf(".");
+    const base = dot >= 0 ? path.slice(0, dot) : path;
+    const ext = dot >= 0 ? path.slice(dot) : "";
+    let n = 2;
+    let next = `${base}_${n}${ext}`;
+    while (used.has(next)) {
+        n += 1;
+        next = `${base}_${n}${ext}`;
+    }
+    used.add(next);
+    return next;
+}
+
+function downloadBlob(blob: Blob, filename: string): void {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.rel = "noopener";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }, 5000);
 }
 
 /* ─── Lightbox ─── */
@@ -761,18 +1140,18 @@ function GalleryPage() {
     const [items, setItems] = useState<GalleryItem[]>([]);
     const [loading, setLoading] = useState(true);
     const [selectedItem, setSelectedItem] = useState<GalleryItem | null>(null);
-    const [tileSize, setTileSize] = useState<TileSize>(() => (storage.get("gallery_tile_size") as TileSize) || "L");
-    const [viewMode, setViewMode] = useState<GalleryViewMode>(() => (storage.get("gallery_view_mode") as GalleryViewMode) || "flat");
+    const [tileSize, setTileSize] = useState<TileSize>("L");
+    const [viewMode, setViewMode] = useState<GalleryViewMode>("folders");
     const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
     const [starredFilter, setStarredFilter] = useState(false);
-    const [customFolders, setCustomFolders] = useState<string[]>(() => {
-        try { return JSON.parse(storage.get("gallery_custom_folders") || "[]"); } catch { return []; }
-    });
+    const [customFolders, setCustomFolders] = useState<string[]>([]);
+    const [prefsLoaded, setPrefsLoaded] = useState(false);
 
     // Multi-select state
     const [selectionMode, setSelectionMode] = useState(false);
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [showMoveMenu, setShowMoveMenu] = useState(false);
+    const [isExportingZip, setIsExportingZip] = useState(false);
 
     // Ref to suppress refresh for optimistic updates (fixes flicker)
     const skipNextRefreshRef = useRef(false);
@@ -792,10 +1171,37 @@ function GalleryPage() {
         return () => document.removeEventListener("mousedown", handler);
     }, [showMoveMenu]);
 
+    // Hydrate preferences after mount to keep server/client first render identical.
+    useEffect(() => {
+        const timer = window.setTimeout(() => {
+            setTileSize((storage.get("gallery_tile_size") as TileSize) || "L");
+            const savedViewMode = storage.get("gallery_view_mode") as GalleryViewMode | null;
+            const folderDefaultKey = "gallery_folder_default_applied";
+            if (!storage.get(folderDefaultKey) && (!savedViewMode || savedViewMode === "flat")) {
+                storage.set(folderDefaultKey, "1");
+                setViewMode("folders");
+            } else {
+                setViewMode(savedViewMode || "folders");
+            }
+            try {
+                setCustomFolders(readStringListSetting(GALLERY_CUSTOM_FOLDERS_KEY));
+            } catch {
+                setCustomFolders([]);
+            }
+            setPrefsLoaded(true);
+        }, 0);
+        return () => window.clearTimeout(timer);
+    }, []);
+
     // Persist preferences
-    useEffect(() => { storage.set("gallery_tile_size", tileSize); }, [tileSize]);
-    useEffect(() => { storage.set("gallery_view_mode", viewMode); }, [viewMode]);
-    useEffect(() => { storage.set("gallery_custom_folders", JSON.stringify(customFolders)); }, [customFolders]);
+    useEffect(() => { if (prefsLoaded) storage.set("gallery_tile_size", tileSize); }, [tileSize, prefsLoaded]);
+    useEffect(() => { if (prefsLoaded) storage.set("gallery_view_mode", viewMode); }, [viewMode, prefsLoaded]);
+    useEffect(() => { if (prefsLoaded) writeStringListSetting(GALLERY_CUSTOM_FOLDERS_KEY, customFolders); }, [customFolders, prefsLoaded]);
+    useEffect(() => {
+        const handler = () => setCustomFolders(readStringListSetting(GALLERY_CUSTOM_FOLDERS_KEY));
+        window.addEventListener(GALLERY_FOLDERS_CHANGED_EVENT, handler);
+        return () => window.removeEventListener(GALLERY_FOLDERS_CHANGED_EVENT, handler);
+    }, []);
 
     const refresh = useCallback(() => {
         setLoading(true);
@@ -805,7 +1211,10 @@ function GalleryPage() {
             .finally(() => setLoading(false));
     }, []);
 
-    useEffect(() => { refresh(); }, [refresh]);
+    useEffect(() => {
+        const timer = window.setTimeout(refresh, 0);
+        return () => window.clearTimeout(timer);
+    }, [refresh]);
 
     // Listen for real-time gallery changes
     useEffect(() => {
@@ -845,11 +1254,7 @@ function GalleryPage() {
     }, []);
 
     const handleDownload = useCallback((item: GalleryItem) => {
-        const a = document.createElement("a");
-        a.href = item.dataUrl;
-        const safeName = item.prompt.replace(/[^a-zA-Z0-9_\-]/g, "_");
-        a.download = `${safeName}.png`;
-        a.click();
+        downloadBase64Image(item.dataUrl, safeFilename(item.prompt));
     }, []);
 
     const handleToggleStar = useCallback((item: GalleryItem) => {
@@ -878,6 +1283,7 @@ function GalleryPage() {
         const trimmed = name.trim();
         if (!customFolders.includes(trimmed)) {
             setCustomFolders(prev => [...prev, trimmed]);
+            window.setTimeout(notifyGalleryFoldersChanged, 0);
         }
     }, [customFolders]);
 
@@ -890,6 +1296,7 @@ function GalleryPage() {
             .then(() => {
                 // Update custom folders list
                 setCustomFolders(prev => prev.map(f => f === oldName ? trimmed : f));
+                window.setTimeout(notifyGalleryFoldersChanged, 0);
                 refresh();
             })
             .catch(err => console.warn("Failed to rename folder:", err));
@@ -901,6 +1308,7 @@ function GalleryPage() {
         updateGalleryItemsBatch(folderName, undefined)
             .then(() => {
                 setCustomFolders(prev => prev.filter(f => f !== folderName));
+                window.setTimeout(notifyGalleryFoldersChanged, 0);
                 refresh();
             })
             .catch(err => console.warn("Failed to delete folder:", err));
@@ -964,6 +1372,37 @@ function GalleryPage() {
             .catch(err => { console.warn("Failed to batch star:", err); skipNextRefreshRef.current = false; refresh(); });
     }, [selectedIds, refresh]);
 
+    const handleBatchDownload = useCallback(async () => {
+        const selected = items.filter(i => selectedIds.has(i.id));
+        if (selected.length === 0 || isExportingZip) return;
+
+        setIsExportingZip(true);
+        try {
+            const { default: JSZip } = await import("jszip");
+            const zip = new JSZip();
+            const usedPaths = new Set<string>();
+
+            for (const item of selected) {
+                const folder = item.folder ? `${safeFilename(item.folder)}/` : "";
+                const filename = `${safeFilename(item.prompt)}${getImageExtensionFromDataUrl(item.dataUrl)}`;
+                const path = uniquePath(`${folder}${filename}`, usedPaths);
+                zip.file(path, getBase64Payload(item.dataUrl), { base64: true });
+            }
+
+            const blob = await zip.generateAsync({
+                type: "blob",
+                compression: "DEFLATE",
+                compressionOptions: { level: 6 },
+            });
+            downloadBlob(blob, `nano-papl-gallery_${selected.length}_images_${Date.now()}.zip`);
+        } catch (err) {
+            console.error("ZIP export failed:", err);
+            alert("Failed to create ZIP archive.");
+        } finally {
+            setIsExportingZip(false);
+        }
+    }, [items, selectedIds, isExportingZip]);
+
     const formatDate = (ts: number) => {
         const d = new Date(ts);
         return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })
@@ -1013,7 +1452,7 @@ function GalleryPage() {
 
     if (loading) {
         return (
-            <PageShell title="Gallery" subtitle="Generated images" icon={Image}>
+            <PageShell title="Gallery" subtitle="Generated images" icon={ImageIcon}>
                 <div className="flex items-center justify-center h-full">
                     <Loader2 size={24} className="animate-spin text-muted-foreground" />
                 </div>
@@ -1023,10 +1462,10 @@ function GalleryPage() {
 
     if (items.length === 0) {
         return (
-            <PageShell title="Gallery" subtitle="Generated images" icon={Image}>
+            <PageShell title="Gallery" subtitle="Generated images" icon={ImageIcon}>
                 <div className="flex flex-col items-center justify-center h-full gap-3">
                     <div className="w-20 h-20 rounded-2xl bg-muted flex items-center justify-center">
-                        <Image size={32} className="text-muted-foreground/30" />
+                        <ImageIcon size={32} className="text-muted-foreground/30" />
                     </div>
                     <p className="text-sm text-muted-foreground">No images yet</p>
                     <p className="text-xs text-muted-foreground/40 max-w-xs text-center">
@@ -1069,11 +1508,16 @@ function GalleryPage() {
             )}
             {/* Star icon — always visible (hidden in selection mode) */}
             {!selectionMode && (
-                <button onClick={(e) => { e.stopPropagation(); handleToggleStar(item); }}
-                    className={`absolute top-1.5 left-1.5 p-1 rounded-md transition-all duration-200 ${item.starred ? "text-yellow-400 bg-black/40" : "text-white/50 bg-black/30 opacity-0 group-hover:opacity-100"}`}
-                    title={item.starred ? "Unstar" : "Star"}>
-                    <Star size={tileSize === "S" ? 10 : 12} fill={item.starred ? "currentColor" : "none"} />
-                </button>
+                <Tooltip
+                    label={item.starred ? "Remove this image from favorites." : "Mark this image as a favorite."}
+                    className={`absolute top-1.5 left-1.5 transition-all duration-200 ${item.starred ? "" : "opacity-0 group-hover:opacity-100"}`}
+                >
+                    <button onClick={(e) => { e.stopPropagation(); handleToggleStar(item); }}
+                        className={`p-1 rounded-md transition-all duration-200 ${item.starred ? "text-yellow-400 bg-black/40" : "text-white/50 bg-black/30"}`}
+                        title={item.starred ? "Unstar" : "Star"}>
+                        <Star size={tileSize === "S" ? 10 : 12} fill={item.starred ? "currentColor" : "none"} />
+                    </button>
+                </Tooltip>
             )}
             {/* Info section */}
             {tileSize === "L" && (
@@ -1098,14 +1542,18 @@ function GalleryPage() {
             {/* Hover overlay actions (hidden in selection mode) */}
             {!selectionMode && (
             <div className="absolute top-1.5 right-1.5 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-                <button onClick={(e) => { e.stopPropagation(); handleDownload(item); }}
-                    className="p-1 rounded-md bg-black/60 hover:bg-black/80 transition-colors" title="Download">
-                    <Download size={tileSize === "S" ? 10 : 12} className="text-white" />
-                </button>
-                <button onClick={(e) => { e.stopPropagation(); setTileMenu({ x: e.clientX, y: e.clientY, item }); }}
-                    className="p-1 rounded-md bg-black/60 hover:bg-black/80 transition-colors" title="More">
-                    <MoreVertical size={tileSize === "S" ? 10 : 12} className="text-white" />
-                </button>
+                <Tooltip label="Download this image.">
+                    <button onClick={(e) => { e.stopPropagation(); handleDownload(item); }}
+                        className="p-1 rounded-md bg-black/60 hover:bg-black/80 transition-colors" title="Download">
+                        <Download size={tileSize === "S" ? 10 : 12} className="text-white" />
+                    </button>
+                </Tooltip>
+                <Tooltip label="Open image actions: move, star, download, or delete.">
+                    <button onClick={(e) => { e.stopPropagation(); setTileMenu({ x: e.clientX, y: e.clientY, item }); }}
+                        className="p-1 rounded-md bg-black/60 hover:bg-black/80 transition-colors" title="More">
+                        <MoreVertical size={tileSize === "S" ? 10 : 12} className="text-white" />
+                    </button>
+                </Tooltip>
             </div>
             )}
         </div>
@@ -1115,7 +1563,7 @@ function GalleryPage() {
     const starCount = items.filter(i => i.starred).length;
 
     return (
-        <PageShell title="Gallery" subtitle={`${items.length} image${items.length !== 1 ? "s" : ""}`} icon={Image}>
+        <PageShell title="Gallery" subtitle={`${items.length} image${items.length !== 1 ? "s" : ""}`} icon={ImageIcon}>
             {/* Lightbox overlay */}
             {selectedItem && (
                 <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-8"
@@ -1131,23 +1579,31 @@ function GalleryPage() {
                                 </p>
                             </div>
                             <div className="flex items-center gap-2 ml-4">
-                                <button onClick={() => handleToggleStar(selectedItem)}
-                                    className={`p-2 rounded-lg transition-colors ${selectedItem.starred ? "bg-yellow-500/20 text-yellow-400" : "bg-white/10 hover:bg-white/20 text-white/60"}`}
-                                    title={selectedItem.starred ? "Unstar" : "Star"}>
-                                    <Star size={16} fill={selectedItem.starred ? "currentColor" : "none"} />
-                                </button>
-                                <button onClick={() => handleDownload(selectedItem)}
-                                    className="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-colors" title="Download">
-                                    <Download size={16} className="text-white" />
-                                </button>
-                                <button onClick={() => handleDelete(selectedItem.id)}
-                                    className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 transition-colors" title="Delete">
-                                    <Trash2 size={16} className="text-red-400" />
-                                </button>
-                                <button onClick={() => setSelectedItem(null)}
-                                    className="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-colors" title="Close">
-                                    <X size={16} className="text-white" />
-                                </button>
+                                <Tooltip label={selectedItem.starred ? "Remove this image from favorites." : "Mark this image as a favorite."}>
+                                    <button onClick={() => handleToggleStar(selectedItem)}
+                                        className={`p-2 rounded-lg transition-colors ${selectedItem.starred ? "bg-yellow-500/20 text-yellow-400" : "bg-white/10 hover:bg-white/20 text-white/60"}`}
+                                        title={selectedItem.starred ? "Unstar" : "Star"}>
+                                        <Star size={16} fill={selectedItem.starred ? "currentColor" : "none"} />
+                                    </button>
+                                </Tooltip>
+                                <Tooltip label="Download this image.">
+                                    <button onClick={() => handleDownload(selectedItem)}
+                                        className="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-colors" title="Download">
+                                        <Download size={16} className="text-white" />
+                                    </button>
+                                </Tooltip>
+                                <Tooltip label="Delete this image from local Gallery storage.">
+                                    <button onClick={() => handleDelete(selectedItem.id)}
+                                        className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 transition-colors" title="Delete">
+                                        <Trash2 size={16} className="text-red-400" />
+                                    </button>
+                                </Tooltip>
+                                <Tooltip label="Close preview and return to Gallery.">
+                                    <button onClick={() => setSelectedItem(null)}
+                                        className="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-colors" title="Close">
+                                        <X size={16} className="text-white" />
+                                    </button>
+                                </Tooltip>
                             </div>
                         </div>
                         <img src={selectedItem.dataUrl} alt={selectedItem.prompt}
@@ -1201,42 +1657,66 @@ function GalleryPage() {
                     /* ── Selection mode toolbar ── */
                     <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
                         <div className="flex items-center gap-2">
-                            <button onClick={exitSelectionMode}
-                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors"
-                                title="Exit selection">
-                                <XCircle size={12} /> Cancel
-                            </button>
+                            <Tooltip label="Leave multi-select mode without changing images.">
+                                <button onClick={exitSelectionMode}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                                    title="Exit selection">
+                                    <XCircle size={12} /> Cancel
+                                </button>
+                            </Tooltip>
                             <span className="text-xs text-muted-foreground">
                                 {selectedIds.size} selected
                             </span>
-                            <button onClick={selectAll}
-                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors">
-                                <CheckSquare size={12} /> Select All
-                            </button>
-                            {selectedIds.size > 0 && (
-                                <button onClick={deselectAll}
+                            <Tooltip label="Select every visible image in the current filter or folder view.">
+                                <button onClick={selectAll}
                                     className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors">
-                                    <Square size={12} /> Deselect
+                                    <CheckSquare size={12} /> Select All
                                 </button>
+                            </Tooltip>
+                            {selectedIds.size > 0 && (
+                                <Tooltip label="Clear the current image selection.">
+                                    <button onClick={deselectAll}
+                                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors">
+                                        <Square size={12} /> Deselect
+                                    </button>
+                                </Tooltip>
                             )}
                         </div>
                         <div className="flex items-center gap-2">
                             {/* Batch star */}
                             {selectedIds.size > 0 && (
-                                <button onClick={() => handleBatchStar(true)}
-                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20 transition-colors"
-                                    title="Star selected">
-                                    <Star size={12} fill="currentColor" /> Star
-                                </button>
+                                <Tooltip label="Mark all selected images as favorites.">
+                                    <button onClick={() => handleBatchStar(true)}
+                                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20 transition-colors"
+                                        title="Star selected">
+                                        <Star size={12} fill="currentColor" /> Star
+                                    </button>
+                                </Tooltip>
+                            )}
+                            {/* Batch download */}
+                            {selectedIds.size > 0 && (
+                                <Tooltip label="Pack selected Gallery images into one ZIP file and download it.">
+                                    <button onClick={handleBatchDownload}
+                                        disabled={isExportingZip}
+                                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50 disabled:cursor-wait"
+                                        title="Download selected images as ZIP">
+                                        {isExportingZip
+                                            ? <Loader2 size={12} className="animate-spin" />
+                                            : <Download size={12} />}
+                                        {isExportingZip ? "Zipping..." : "Download ZIP"}
+                                    </button>
+                                </Tooltip>
                             )}
                             {/* Batch move to folder */}
                             {selectedIds.size > 0 && (
                                 <div className="relative" ref={moveMenuRef}>
-                                    <button onClick={() => setShowMoveMenu(!showMoveMenu)}
-                                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
-                                        title="Move selected to folder">
-                                        <FolderOpen size={12} /> Move to…
-                                    </button>
+                                    <Tooltip label="Move selected images into an existing or new Gallery folder.">
+                                        <button onClick={() => setShowMoveMenu(!showMoveMenu)}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
+                                            title="Move selected to folder">
+                                            <FolderOpen size={12} /> Move to…
+                                        </button>
+                                    </Tooltip>
                                     {showMoveMenu && (
                                         <div className="absolute top-full right-0 mt-1 min-w-[180px] py-1 rounded-lg bg-card border border-border shadow-xl z-50 animate-fade-in">
                                             <button onClick={() => handleBatchMoveToFolder(undefined)}
@@ -1256,6 +1736,7 @@ function GalleryPage() {
                                                     const trimmed = name.trim();
                                                     if (!customFolders.includes(trimmed)) {
                                                         setCustomFolders(prev => [...prev, trimmed]);
+                                                        window.setTimeout(notifyGalleryFoldersChanged, 0);
                                                     }
                                                     handleBatchMoveToFolder(trimmed);
                                                 }
@@ -1269,11 +1750,13 @@ function GalleryPage() {
                             )}
                             {/* Batch delete */}
                             {selectedIds.size > 0 && (
-                                <button onClick={handleBatchDelete}
-                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-red-400 hover:bg-red-500/10 transition-colors"
-                                    title="Delete selected">
-                                    <Trash2 size={12} /> Delete
-                                </button>
+                                <Tooltip label="Delete all selected images from local Gallery storage.">
+                                    <button onClick={handleBatchDelete}
+                                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-red-400 hover:bg-red-500/10 transition-colors"
+                                        title="Delete selected">
+                                        <Trash2 size={12} /> Delete
+                                    </button>
+                                </Tooltip>
                             )}
                         </div>
                     </div>
@@ -1282,52 +1765,64 @@ function GalleryPage() {
                     <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
                         <div className="flex items-center gap-2">
                             {/* View mode toggle */}
-                            <button onClick={() => setViewMode(viewMode === "flat" ? "folders" : "flat")}
-                                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${viewMode === "folders" ? "bg-accent/15 text-accent" : "bg-muted text-muted-foreground hover:text-foreground"}`}
-                                title={viewMode === "flat" ? "Switch to folder view" : "Switch to flat view"}>
-                                {viewMode === "flat" ? <FolderOpen size={12} /> : <LayoutGrid size={12} />}
-                                {viewMode === "flat" ? "Folders" : "Flat"}
-                            </button>
+                            <Tooltip label={viewMode === "flat" ? "Group Gallery images by folder." : "Show all Gallery images in one grid."}>
+                                <button onClick={() => setViewMode(viewMode === "flat" ? "folders" : "flat")}
+                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${viewMode === "folders" ? "bg-accent/15 text-accent" : "bg-muted text-muted-foreground hover:text-foreground"}`}
+                                    title={viewMode === "flat" ? "Switch to folder view" : "Switch to flat view"}>
+                                    {viewMode === "flat" ? <FolderOpen size={12} /> : <LayoutGrid size={12} />}
+                                    {viewMode === "flat" ? "Folders" : "Flat"}
+                                </button>
+                            </Tooltip>
 
                             {/* Star filter */}
-                            <button onClick={() => setStarredFilter(!starredFilter)}
-                                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${starredFilter ? "bg-yellow-500/15 text-yellow-400" : "bg-muted text-muted-foreground hover:text-foreground"}`}
-                                title={starredFilter ? "Show all" : "Show starred only"}>
-                                <Star size={12} fill={starredFilter ? "currentColor" : "none"} />
-                                {starCount > 0 && <span>{starCount}</span>}
-                            </button>
+                            <Tooltip label={starredFilter ? "Return to all Gallery images." : "Show only favorite images."}>
+                                <button onClick={() => setStarredFilter(!starredFilter)}
+                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${starredFilter ? "bg-yellow-500/15 text-yellow-400" : "bg-muted text-muted-foreground hover:text-foreground"}`}
+                                    title={starredFilter ? "Show all" : "Show starred only"}>
+                                    <Star size={12} fill={starredFilter ? "currentColor" : "none"} />
+                                    {starCount > 0 && <span>{starCount}</span>}
+                                </button>
+                            </Tooltip>
 
                             {/* Select mode */}
-                            <button onClick={() => setSelectionMode(true)}
-                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors"
-                                title="Select multiple images">
-                                <CheckSquare size={12} /> Select
-                            </button>
+                            <Tooltip label="Select multiple images so you can move, delete, star, or download them together.">
+                                <button onClick={() => setSelectionMode(true)}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                                    title="Select multiple images">
+                                    <CheckSquare size={12} /> Select
+                                </button>
+                            </Tooltip>
 
                             {/* New folder */}
                             {viewMode === "folders" && (
-                                <button onClick={handleCreateFolder}
-                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors"
-                                    title="Create new folder">
-                                    <FolderPlus size={12} /> New
-                                </button>
+                                <Tooltip label="Create an empty Gallery folder for organizing images.">
+                                    <button onClick={handleCreateFolder}
+                                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                                        title="Create new folder">
+                                        <FolderPlus size={12} /> New
+                                    </button>
+                                </Tooltip>
                             )}
 
                             {/* Tile size selector */}
                             <div className="flex items-center rounded-lg overflow-hidden border border-border">
                                 {(["S", "M", "L"] as TileSize[]).map(size => (
-                                    <button key={size} onClick={() => setTileSize(size)}
-                                        className={`px-2.5 py-1 text-[10px] font-semibold transition-colors ${tileSize === size ? "bg-accent/15 text-accent" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}>
-                                        {size}
-                                    </button>
+                                    <Tooltip key={size} label={`${size} thumbnail size for the Gallery grid.`}>
+                                        <button onClick={() => setTileSize(size)}
+                                            className={`px-2.5 py-1 text-[10px] font-semibold transition-colors ${tileSize === size ? "bg-accent/15 text-accent" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}>
+                                            {size}
+                                        </button>
+                                    </Tooltip>
                                 ))}
                             </div>
                         </div>
 
-                        <button onClick={handleClearAll}
-                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-red-400 hover:bg-red-500/10 transition-colors">
-                            <Trash2 size={12} /> Clear All
-                        </button>
+                        <Tooltip label="Delete every image in the local Gallery. This asks for confirmation.">
+                            <button onClick={handleClearAll}
+                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-red-400 hover:bg-red-500/10 transition-colors">
+                                <Trash2 size={12} /> Clear All
+                            </button>
+                        </Tooltip>
                     </div>
                 )}
 
@@ -1387,11 +1882,13 @@ function GalleryPage() {
                                         </button>
                                         {/* Folder actions menu */}
                                         {isUserFolder && (
-                                            <button onClick={(e) => { e.stopPropagation(); setFolderMenu({ x: e.clientX, y: e.clientY, folder }); }}
-                                                className="p-2 mr-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-                                                title="Folder actions">
-                                                <MoreVertical size={14} />
-                                            </button>
+                                            <Tooltip label="Rename or delete this Gallery folder.">
+                                                <button onClick={(e) => { e.stopPropagation(); setFolderMenu({ x: e.clientX, y: e.clientY, folder }); }}
+                                                    className="p-2 mr-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                                                    title="Folder actions">
+                                                    <MoreVertical size={14} />
+                                                </button>
+                                            </Tooltip>
                                         )}
                                     </div>
                                     {/* Folder content */}
@@ -1425,6 +1922,38 @@ function formatBytes(bytes: number): string {
     const units = ["B", "KB", "MB", "GB"];
     const i = Math.floor(Math.log(bytes) / Math.log(1024));
     return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+}
+
+function ModelCatalogue() {
+    return (
+        <div className="flex flex-col gap-3">
+            <p className="text-xs text-muted-foreground">
+                Reference only. Pick the active model directly in Chat or Batch.
+            </p>
+            <div className="flex flex-col gap-3">
+                {PROVIDERS.map((provider) => (
+                    <div key={provider.slug} className="rounded-xl bg-muted/60 border border-border/60 overflow-hidden">
+                        <div className="px-4 py-2 text-[10px] uppercase tracking-wider text-muted-foreground border-b border-border/50">
+                            {provider.name}
+                        </div>
+                        <div className="flex flex-col">
+                            {provider.models.map((model) => (
+                                <div key={model.id}
+                                    className="flex items-center justify-between gap-3 px-4 py-2.5 text-xs border-b border-border/30 last:border-b-0">
+                                    <span className="text-foreground">{getModelLabel(model.id)}</span>
+                                    <span className="flex gap-1 shrink-0">
+                                        {model.capabilities.imageToImage && <CapabilityBadge type="IMG2IMG" />}
+                                        {model.capabilities.textToImage && <CapabilityBadge type="TXT2IMG" />}
+                                        {model.capabilities.chat && <CapabilityBadge type="CHAT" />}
+                                    </span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
 }
 
 function SettingsPage() {
@@ -1516,12 +2045,19 @@ function SettingsPage() {
     return (
         <PageShell title="Settings" subtitle="API keys and preferences" icon={Settings} centered>
             <div className="max-w-xl mx-auto flex flex-col gap-8 p-6 overflow-y-auto h-full">
+                {/* ─── Provider Selection ─── */}
+                <Section title="Available Models">
+                    <ModelCatalogue />
+                </Section>
+
                 <Section title="API Keys" action={
-                    <button onClick={handleSave}
-                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 active:scale-95
-                            ${saved ? "bg-green-500/20 text-green-400" : "bg-accent text-white hover:bg-accent-hover"}`}>
-                        {saved ? <><Check size={12} /> Saved!</> : <><Save size={12} /> Save Keys</>}
-                    </button>
+                    <Tooltip label="Save API keys in this browser's local storage.">
+                        <button onClick={handleSave}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 active:scale-95
+                                ${saved ? "bg-green-500/20 text-green-400" : "bg-accent text-white hover:bg-accent-hover"}`}>
+                            {saved ? <><Check size={12} /> Saved!</> : <><Save size={12} /> Save Keys</>}
+                        </button>
+                    </Tooltip>
                 }>
                     <div className="flex flex-col gap-3">
                         <SettingsInput label="Google Gemini" placeholder="AIza..." type="password"
@@ -1535,10 +2071,12 @@ function SettingsPage() {
 
                 {/* ─── Storage Management ─── */}
                 <Section title="Storage" action={
-                    <button onClick={refreshStorageInfo} disabled={loadingSize}
-                        className="text-xs text-muted-foreground hover:text-foreground transition-colors">
-                        {loadingSize ? <Loader2 size={12} className="animate-spin" /> : "Refresh"}
-                    </button>
+                    <Tooltip label="Recalculate local browser storage usage.">
+                        <button onClick={refreshStorageInfo} disabled={loadingSize}
+                            className="text-xs text-muted-foreground hover:text-foreground transition-colors">
+                            {loadingSize ? <Loader2 size={12} className="animate-spin" /> : "Refresh"}
+                        </button>
+                    </Tooltip>
                 }>
                     <Card className="flex flex-col gap-3">
                         {/* Total usage bar */}
@@ -1576,13 +2114,15 @@ function SettingsPage() {
 
                         {/* Clean orphans button */}
                         <div className="flex items-center gap-2 pt-1">
-                            <button onClick={handleCleanOrphans} disabled={cleaningOrphans}
-                                className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-muted hover:bg-card-hover transition-all duration-200 active:scale-[0.98] disabled:opacity-50">
-                                {cleaningOrphans
-                                    ? <Loader2 size={12} className="animate-spin" />
-                                    : <Sparkles size={12} />}
-                                Clean Orphaned Images
-                            </button>
+                            <Tooltip label="Remove image blobs that are no longer referenced by any chat message.">
+                                <button onClick={handleCleanOrphans} disabled={cleaningOrphans}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-muted hover:bg-card-hover transition-all duration-200 active:scale-[0.98] disabled:opacity-50">
+                                    {cleaningOrphans
+                                        ? <Loader2 size={12} className="animate-spin" />
+                                        : <Sparkles size={12} />}
+                                    Clean Orphaned Images
+                                </button>
+                            </Tooltip>
                             {orphanResult && (
                                 <span className="text-xs text-green-400">{orphanResult}</span>
                             )}
@@ -1620,10 +2160,12 @@ function SettingsPage() {
                                     This action cannot be undone.
                                 </p>
                                 {!showClearConfirm ? (
-                                    <button onClick={() => setShowClearConfirm(true)}
-                                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-all duration-200 active:scale-95">
-                                        <Trash2 size={12} /> Delete Everything
-                                    </button>
+                                    <Tooltip label="This starts a confirmation step before deleting all local app data.">
+                                        <button onClick={() => setShowClearConfirm(true)}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-all duration-200 active:scale-95">
+                                            <Trash2 size={12} /> Delete Everything
+                                        </button>
+                                    </Tooltip>
                                 ) : (
                                     <div className="flex flex-col gap-2 p-3 bg-red-500/10 rounded-lg border border-red-500/20">
                                         <p className="text-xs text-red-300 font-medium">Are you absolutely sure?</p>
@@ -1647,6 +2189,10 @@ function SettingsPage() {
                         </div>
                     </Card>
                 </Section>
+
+                <p className="pb-2 text-center text-[10px] text-muted-foreground/50">
+                    {APP_VERSION}
+                </p>
             </div>
         </PageShell>
     );

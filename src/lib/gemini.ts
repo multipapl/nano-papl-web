@@ -4,6 +4,7 @@
  */
 
 import type { ChatMessage } from "./storage";
+import { assertSafePayloadSize } from "./payload-limits";
 
 export interface GeminiConfig {
     model: string;
@@ -99,17 +100,20 @@ export async function sendGeminiMessage(
         : undefined;
 
     try {
+        const payload = JSON.stringify({
+            apiKey,
+            modelId: config.model,
+            contents,
+            systemInstruction: systemInstruction || "You are a helpful AI assistant for architectural visualization. Help the user with their questions and generate images when requested.",
+            responseModalities,
+            imageConfig,
+        });
+        assertSafePayloadSize(payload, "Gemini request");
+
         const res = await fetch("/api/gemini", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                apiKey,
-                modelId: config.model,
-                contents,
-                systemInstruction: systemInstruction || "You are a helpful AI assistant for architectural visualization. Help the user with their questions and generate images when requested.",
-                responseModalities,
-                imageConfig,
-            }),
+            body: payload,
         });
 
         const data = await res.json();

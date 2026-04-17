@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useEffect } from "react";
-import { Play, Square, Pause, RotateCcw, Loader2 } from "lucide-react";
+import { Play, Square, RotateCcw, Loader2 } from "lucide-react";
 import { ImageCompare } from "./image-compare";
 
 export type BatchStatus = "idle" | "running" | "paused" | "completed" | "stopped";

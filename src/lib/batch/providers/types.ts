@@ -8,6 +8,8 @@ export interface GenerationParams {
     inputImage: string; // base64 data URL
     resolution: string; // "1K" | "2K" | "4K"
     aspectRatio: string; // "16:9" | "1:1" | "Auto" | etc.
+    /** Provider-specific extra parameters (e.g. strength, guidance_scale for fal.ai). */
+    providerParams?: Record<string, unknown>;
 }
 
 export interface GenerationResult {
@@ -93,7 +95,7 @@ export interface BatchConfig {
 }
 
 export const DEFAULT_BATCH_CONFIG: BatchConfig = {
-    resolution: "1K",
+    resolution: "2K",
     aspectRatio: "16:9",
     outputFormat: "PNG",
     saveToGallery: true,

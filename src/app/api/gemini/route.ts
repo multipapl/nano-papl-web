@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { SAFE_FUNCTION_PAYLOAD_LIMIT_BYTES } from "@/lib/payload-limits";
 
 /**
  * Gemini API proxy route.
@@ -15,9 +16,40 @@ import { NextRequest, NextResponse } from "next/server";
  */
 
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const STREAM_CHUNK_SIZE = 64 * 1024;
+
+function streamJson(json: string): Response {
+    const encoder = new TextEncoder();
+    let offset = 0;
+
+    const stream = new ReadableStream({
+        pull(controller) {
+            if (offset >= json.length) {
+                controller.close();
+                return;
+            }
+
+            const chunk = json.slice(offset, offset + STREAM_CHUNK_SIZE);
+            offset += STREAM_CHUNK_SIZE;
+            controller.enqueue(encoder.encode(chunk));
+        },
+    });
+
+    return new Response(stream, {
+        headers: { "Content-Type": "application/json" },
+    });
+}
 
 export async function POST(request: NextRequest) {
     try {
+        const contentLength = Number(request.headers.get("content-length") || 0);
+        if (contentLength > SAFE_FUNCTION_PAYLOAD_LIMIT_BYTES) {
+            return NextResponse.json(
+                { error: "Gemini request is too large for Vercel Functions. Reduce the input image size or resolution." },
+                { status: 413 },
+            );
+        }
+
         const body = await request.json();
         const { apiKey, modelId, contents, systemInstruction, responseModalities, imageConfig } = body;
 
@@ -67,7 +99,8 @@ export async function POST(request: NextRequest) {
         }
 
         const data = await response.json();
-        return NextResponse.json(data);
+        const responsePayload = JSON.stringify(data);
+        return streamJson(responsePayload);
     } catch (error: unknown) {
         const message = error instanceof Error ? error.message : "Internal server error";
         return NextResponse.json({ error: message }, { status: 500 });

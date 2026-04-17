@@ -5,6 +5,16 @@ import { X, Check, AlertTriangle, Zap, Download, Loader2 } from "lucide-react";
 import type { ImageAnalysis, ResolutionTier } from "@/lib/resolutions";
 import { fileKey } from "@/lib/resolutions";
 import { resizeAll, downloadFiles, type ResizeProgress } from "@/lib/image-resizer";
+import { saveGalleryItem } from "@/lib/image-db";
+
+function fileToDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
+}
 
 interface ImageOptimizerPanelProps {
     files: File[];
@@ -28,6 +38,7 @@ export function ImageOptimizerPanel({
     const [progress, setProgress] = useState<ResizeProgress | null>(null);
     const [lastResized, setLastResized] = useState<Map<string, File> | null>(null);
     const [isDone, setIsDone] = useState(false);
+    const [savedToGalleryCount, setSavedToGalleryCount] = useState(0);
 
     const needsOptimization = files.filter((f) => {
         const a = analysisMap.get(fileKey(f));
@@ -40,6 +51,7 @@ export function ImageOptimizerPanel({
         setIsProcessing(true);
         setProgress(null);
         setIsDone(false);
+        setSavedToGalleryCount(0);
 
         try {
             const { optimizedFiles, resizedMap } = await resizeAll(
@@ -50,13 +62,40 @@ export function ImageOptimizerPanel({
 
             setLastResized(resizedMap);
             onOptimized(optimizedFiles);
+
+            // Save each resized image to the Gallery in the same folder as the
+            // original's batch variants (folder = original basename), with
+            // suffix "_optimized_<tier>" so it's visually obvious in the list.
+            const savePromises = files.map(async (file) => {
+                const resized = resizedMap.get(fileKey(file));
+                if (!resized) return false;
+                try {
+                    const dataUrl = await fileToDataUrl(resized);
+                    const baseName = file.name.replace(/\.[^.]+$/, "");
+                    await saveGalleryItem({
+                        id: crypto.randomUUID(),
+                        dataUrl,
+                        prompt: `${baseName}_optimized_${tier}`,
+                        folder: baseName,
+                        source: "batch",
+                        createdAt: Date.now(),
+                    });
+                    return true;
+                } catch (err) {
+                    console.warn(`Failed to save ${file.name} to gallery:`, err);
+                    return false;
+                }
+            });
+            const results = await Promise.all(savePromises);
+            setSavedToGalleryCount(results.filter(Boolean).length);
+
             setIsDone(true);
         } catch (err) {
             console.error("Optimization failed:", err);
         } finally {
             setIsProcessing(false);
         }
-    }, [files, analysisMap, onOptimized]);
+    }, [files, analysisMap, onOptimized, tier]);
 
     const handleSaveToDisk = useCallback(() => {
         if (lastResized && lastResized.size > 0) {
@@ -172,7 +211,8 @@ export function ImageOptimizerPanel({
                     <div className="flex items-center gap-2 flex-1 min-w-0">
                         <Check size={14} className="text-green-400 shrink-0" />
                         <span className="text-xs text-green-400">
-                            Optimization complete. Images updated in batch.
+                            Optimization complete. Images updated in batch
+                            {savedToGalleryCount > 0 && ` · ${savedToGalleryCount} saved to Gallery`}.
                         </span>
                     </div>
                 )}

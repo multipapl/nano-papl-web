@@ -1,0 +1,51 @@
+/**
+ * Fal.ai client for Chat mode.
+ * Thin adapter over FalProvider — keeps Chat's text/imageData response shape
+ * while reusing the same endpoint/input logic as Batch.
+ */
+
+import { FalProvider } from "@/lib/batch/providers/fal-provider";
+
+export interface FalChatConfig {
+    model: string;
+    resolution: string;
+    ratio: string;
+}
+
+export interface FalResponse {
+    text: string;
+    imageData?: string; // base64 data URL
+    error?: string;
+}
+
+/**
+ * Send an image generation request to Fal.ai via our API proxy.
+ * Used by the Chat page when a Fal.ai model is selected.
+ */
+export async function sendFalMessage(
+    apiKey: string,
+    userText: string,
+    userImageBase64: string | null,
+    config: FalChatConfig,
+): Promise<FalResponse> {
+    if (!userText && !userImageBase64) {
+        return { text: "", error: "Please provide a prompt or an image." };
+    }
+
+    const provider = new FalProvider(apiKey, config.model);
+    const result = await provider.generate({
+        prompt: userText || "Generate an image",
+        inputImage: userImageBase64 || "",
+        resolution: config.resolution,
+        aspectRatio: config.ratio,
+    });
+
+    if (!result.success) {
+        return { text: "", error: result.error || "Unknown fal error" };
+    }
+
+    return {
+        text: result.imageDataUrl ? "Image generated successfully." : "No image was returned.",
+        imageData: result.imageDataUrl,
+    };
+}

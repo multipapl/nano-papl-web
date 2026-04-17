@@ -10,11 +10,16 @@ import { ConstructorPanel, createDefaultConstructorState } from "./constructor-p
 import { buildPromptVariants, countActiveVariants, type ConstructorState } from "@/lib/batch/prompt-builder";
 import { runBatch, formatETA, type BatchEvent } from "@/lib/batch/batch-engine";
 import { GeminiProvider } from "@/lib/batch/providers/gemini-provider";
+import { FalProvider } from "@/lib/batch/providers/fal-provider";
 import { DEFAULT_BATCH_CONFIG, type BatchConfig } from "@/lib/batch/providers/types";
+import type { ImageProvider } from "@/lib/batch/providers/types";
 import { storage } from "@/lib/storage";
+import { getProviderSelection, getApiKeyForProvider } from "@/lib/providers/provider-config";
+import { getModel, withModelName } from "@/lib/providers/registry";
 import { saveGalleryItem } from "@/lib/image-db";
 import { ImageOptimizerPanel } from "./image-optimizer-panel";
 import { type ImageAnalysis, type ResolutionTier, analyzeFiles } from "@/lib/resolutions";
+import { Tooltip } from "@/components/ui/tooltip";
 
 // ─── State ───
 
@@ -147,7 +152,13 @@ function batchReducer(state: BatchState, action: BatchAction): BatchState {
 function loadPersistedConfig(): BatchConfig {
     try {
         const raw = storage.get("batch_config");
-        return raw ? { ...DEFAULT_BATCH_CONFIG, ...JSON.parse(raw) } : DEFAULT_BATCH_CONFIG;
+        const config = raw ? { ...DEFAULT_BATCH_CONFIG, ...JSON.parse(raw) } : DEFAULT_BATCH_CONFIG;
+        const migrationKey = "batch_default_resolution_2k_applied";
+        if (!storage.get(migrationKey) && config.resolution === "1K") {
+            storage.set(migrationKey, "1");
+            return { ...config, resolution: "2K" };
+        }
+        return config;
     } catch { return DEFAULT_BATCH_CONFIG; }
 }
 
@@ -156,6 +167,30 @@ function loadPersistedConstructor(): ConstructorState {
         const raw = storage.get("constructor_state");
         return raw ? JSON.parse(raw) : createDefaultConstructorState();
     } catch { return createDefaultConstructorState(); }
+}
+
+function baseName(filename: string): string {
+    return filename.replace(/\.[^.]+$/, "");
+}
+
+function todayPrefix(): string {
+    return new Date().toISOString().slice(0, 10);
+}
+
+function getInputFolderName(files: File[]): string {
+    const prefix = todayPrefix();
+    if (files.length === 0) return `${prefix}_Batch`;
+    if (files.length === 1) return `${prefix}_${baseName(files[0].name)}`;
+
+    const folderNames = files
+        .map((file) => file.webkitRelativePath?.split(/[\\/]/)[0])
+        .filter((folder): folder is string => !!folder);
+
+    if (folderNames.length === files.length && folderNames.every((folder) => folder === folderNames[0])) {
+        return `${prefix}_${folderNames[0]}`;
+    }
+
+    return `${prefix}_Batch_${new Date().toISOString().slice(11, 16).replace(":", "")}`;
 }
 
 function createInitialState(): BatchState {
@@ -186,13 +221,16 @@ function createInitialState(): BatchState {
 export function BatchPage() {
     const [state, dispatch] = useReducer(batchReducer, null, createInitialState);
     const abortRef = useRef<AbortController | null>(null);
+    const activeBatchModelIdRef = useRef<string>("");
+    const activeBatchFolderRef = useRef<string>("");
     const [hasApiKey, setHasApiKey] = useState(false);
 
     // Hydrate persisted state from localStorage after mount (avoids hydration mismatch)
     useEffect(() => {
         dispatch({ type: "SET_CONFIG", config: loadPersistedConfig() });
         dispatch({ type: "SET_CONSTRUCTOR", state: loadPersistedConstructor() });
-        setHasApiKey(!!storage.getGeminiKey());
+        const sel = getProviderSelection();
+        setHasApiKey(!!getApiKeyForProvider(sel.provider));
     }, []);
 
     // Persist config changes
@@ -260,13 +298,13 @@ export function BatchPage() {
                     // Build descriptive name: OriginalName_Season_Lighting[_Xmas]
                     const baseName = event.task.imageFile.name.replace(/\.[^.]+$/, "");
                     const variantTitle = event.task.promptVariant.title;
-                    const displayName = `${baseName}_${variantTitle}`;
+                    const displayName = withModelName(`${baseName}_${variantTitle}`, activeBatchModelIdRef.current);
 
                     saveGalleryItem({
                         id: crypto.randomUUID(),
                         dataUrl: event.result.imageDataUrl,
                         prompt: displayName,
-                        folder: baseName,
+                        folder: activeBatchFolderRef.current || baseName,
                         source: "batch",
                         createdAt: Date.now(),
                     }).catch((err) => console.warn("Failed to save to gallery:", err));
@@ -285,9 +323,20 @@ export function BatchPage() {
     }, []);
 
     const handleStart = useCallback(async () => {
-        const apiKey = storage.getGeminiKey();
+        // Get active provider and API key dynamically
+        const selection = getProviderSelection();
+        const apiKey = getApiKeyForProvider(selection.provider);
+        const providerName = selection.provider === "gemini" ? "Gemini" : "Fal.ai";
+
         if (!apiKey) {
-            dispatch({ type: "LOG", message: "[ERROR] No Gemini API key. Go to Settings." });
+            dispatch({ type: "LOG", message: `[ERROR] No ${providerName} API key. Go to Settings.` });
+            return;
+        }
+
+        // Batch always feeds an input image per task — require an img2img-capable model.
+        const model = getModel(selection.modelId);
+        if (model && !model.capabilities.imageToImage) {
+            dispatch({ type: "LOG", message: `[ERROR] ${model.label} does not support image-to-image. Pick a different model in Settings.` });
             return;
         }
 
@@ -307,11 +356,21 @@ export function BatchPage() {
 
         const totalTasks = currentState.files.length * prompts.length;
         dispatch({ type: "BATCH_START", totalCount: totalTasks });
+        dispatch({ type: "LOG", message: `Using provider: ${providerName} (${selection.modelId})` });
+        activeBatchModelIdRef.current = selection.modelId;
+        activeBatchFolderRef.current = getInputFolderName(currentState.files);
+        dispatch({ type: "LOG", message: `Gallery folder: ${activeBatchFolderRef.current}` });
 
         const controller = new AbortController();
         abortRef.current = controller;
 
-        const provider = new GeminiProvider(apiKey);
+        // Create appropriate provider based on selection
+        let provider: ImageProvider;
+        if (selection.provider === "fal") {
+            provider = new FalProvider(apiKey, selection.modelId);
+        } else {
+            provider = new GeminiProvider(apiKey, selection.modelId);
+        }
 
         try {
             for await (const event of runBatch(currentState.files, prompts, provider, currentState.config, controller.signal)) {
@@ -380,28 +439,33 @@ export function BatchPage() {
 
                     {/* Image Optimizer button — only show when files are loaded */}
                     {state.files.length > 0 && state.imageAnalysis.size > 0 && (
-                        <button
-                            onClick={() => dispatch({ type: "TOGGLE_OPTIMIZER", open: true })}
-                            disabled={isRunning}
-                            className={`flex items-center gap-3 px-4 py-2.5 rounded-xl transition-all duration-200 active:scale-[0.98] group
-                                ${needsOptimizationCount > 0
-                                    ? "bg-yellow-500/10 border border-yellow-500/30 hover:border-yellow-500/50 hover:bg-yellow-500/15"
-                                    : "bg-green-500/10 border border-green-500/30 hover:border-green-500/50 hover:bg-green-500/15"}
-                                ${isRunning ? "opacity-50 cursor-not-allowed" : ""}`}
+                        <Tooltip
+                            label="Open the optimizer to resize source images before sending the batch."
+                            className="w-full"
                         >
-                            <Zap size={16} className={needsOptimizationCount > 0 ? "text-yellow-400" : "text-green-400"} />
-                            <div className="text-left flex-1">
-                                <p className="text-xs font-medium">
-                                    {needsOptimizationCount > 0
-                                        ? `${needsOptimizationCount} image${needsOptimizationCount !== 1 ? "s" : ""} need optimization`
-                                        : "All images optimized"}
-                                </p>
-                                <p className="text-[10px] text-muted-foreground">
-                                    Resolution check for {state.config.resolution} tier
-                                </p>
-                            </div>
-                            <ChevronDown size={14} className="text-muted-foreground -rotate-90" />
-                        </button>
+                            <button
+                                onClick={() => dispatch({ type: "TOGGLE_OPTIMIZER", open: true })}
+                                disabled={isRunning}
+                                className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-xl transition-all duration-200 active:scale-[0.98] group
+                                    ${needsOptimizationCount > 0
+                                        ? "bg-yellow-500/10 border border-yellow-500/30 hover:border-yellow-500/50 hover:bg-yellow-500/15"
+                                        : "bg-green-500/10 border border-green-500/30 hover:border-green-500/50 hover:bg-green-500/15"}
+                                    ${isRunning ? "opacity-50 cursor-not-allowed" : ""}`}
+                            >
+                                <Zap size={16} className={needsOptimizationCount > 0 ? "text-yellow-400" : "text-green-400"} />
+                                <div className="text-left flex-1">
+                                    <p className="text-xs font-medium">
+                                        {needsOptimizationCount > 0
+                                            ? `${needsOptimizationCount} image${needsOptimizationCount !== 1 ? "s" : ""} need optimization`
+                                            : "All images optimized"}
+                                    </p>
+                                    <p className="text-[10px] text-muted-foreground">
+                                        Resolution check for {state.config.resolution} tier
+                                    </p>
+                                </div>
+                                <ChevronDown size={14} className="text-muted-foreground -rotate-90" />
+                            </button>
+                        </Tooltip>
                     )}
 
                     {/* Generation Settings */}
@@ -415,10 +479,14 @@ export function BatchPage() {
                     </div>
 
                     {/* Constructor button */}
+                    <Tooltip
+                        label="Open the prompt builder for scene settings, seasons, lighting, and prompt variants."
+                        className="w-full"
+                    >
                     <button
                         onClick={() => dispatch({ type: "TOGGLE_CONSTRUCTOR", open: true })}
                         disabled={isRunning}
-                        className={`flex items-center gap-3 px-4 py-3 rounded-xl bg-card border border-border hover:border-accent/40 hover:bg-card-hover transition-all duration-200 active:scale-[0.98] group
+                        className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-card border border-border hover:border-accent/40 hover:bg-card-hover transition-all duration-200 active:scale-[0.98] group
                             ${isRunning ? "opacity-50 cursor-not-allowed" : ""}`}
                     >
                         <SlidersHorizontal size={18} className="text-muted-foreground group-hover:text-accent transition-colors duration-200" />
@@ -430,6 +498,7 @@ export function BatchPage() {
                         </div>
                         <ChevronDown size={14} className="text-muted-foreground -rotate-90" />
                     </button>
+                    </Tooltip>
 
                     {/* Task summary */}
                     {state.files.length > 0 && variantCount > 0 && (

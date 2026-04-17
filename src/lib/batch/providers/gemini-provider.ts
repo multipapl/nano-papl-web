@@ -4,6 +4,7 @@
  */
 
 import type { ImageProvider, GenerationParams, GenerationResult } from "./types";
+import { assertSafePayloadSize } from "@/lib/payload-limits";
 
 export class GeminiProvider implements ImageProvider {
     readonly name = "Google Gemini";
@@ -15,7 +16,7 @@ export class GeminiProvider implements ImageProvider {
         this.modelId = modelId;
     }
 
-    async generate(params: GenerationParams, _signal?: AbortSignal): Promise<GenerationResult> {
+    async generate(params: GenerationParams): Promise<GenerationResult> {
         const start = performance.now();
 
         try {
@@ -48,17 +49,20 @@ export class GeminiProvider implements ImageProvider {
             // NOTE: signal is intentionally NOT passed to fetch() so that
             // in-flight requests complete naturally. The batch engine checks
             // signal.aborted between tasks to implement graceful stop.
+            const payload = JSON.stringify({
+                apiKey: this.apiKey,
+                modelId: this.modelId,
+                contents,
+                systemInstruction: "You are an architectural visualization AI. Generate the image exactly as described in the prompt. Do not add text overlays.",
+                responseModalities: ["TEXT", "IMAGE"],
+                imageConfig,
+            });
+            assertSafePayloadSize(payload, "Gemini request");
+
             const res = await fetch("/api/gemini", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    apiKey: this.apiKey,
-                    modelId: this.modelId,
-                    contents,
-                    systemInstruction: "You are an architectural visualization AI. Generate the image exactly as described in the prompt. Do not add text overlays.",
-                    responseModalities: ["TEXT", "IMAGE"],
-                    imageConfig,
-                }),
+                body: payload,
             });
 
             const data = await res.json();

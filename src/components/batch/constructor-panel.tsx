@@ -119,14 +119,10 @@ interface ConstructorPanelProps {
 
 export function ConstructorPanel({ state, onChange, onClose }: ConstructorPanelProps) {
     const [activeSeason, setActiveSeason] = useState("Winter");
-    const [presets, setPresets] = useState<ConstructorPreset[]>([]);
+    const [presets, setPresets] = useState<ConstructorPreset[]>(loadPresets);
     const [showPresets, setShowPresets] = useState(false);
     const [newPresetName, setNewPresetName] = useState("");
     const [showPromptPreview, setShowPromptPreview] = useState(false);
-
-    useEffect(() => {
-        setPresets(loadPresets());
-    }, []);
 
     const update = <K extends keyof ConstructorState>(key: K, val: ConstructorState[K]) => {
         onChange({ ...state, [key]: val });

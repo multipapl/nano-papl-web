@@ -59,6 +59,23 @@ export const storage = {
         localStorage.setItem(key("openrouter_key"), v);
     },
 
+    // ─── Active Provider/Model ───
+    getActiveProvider: (): string => {
+        if (typeof window === "undefined") return "gemini";
+        return localStorage.getItem(key("active_provider")) || "gemini";
+    },
+    setActiveProvider: (v: string) => {
+        localStorage.setItem(key("active_provider"), v);
+    },
+
+    getActiveModel: (): string => {
+        if (typeof window === "undefined") return "gemini-3-pro-image-preview";
+        return localStorage.getItem(key("active_model")) || "gemini-3-pro-image-preview";
+    },
+    setActiveModel: (v: string) => {
+        localStorage.setItem(key("active_model"), v);
+    },
+
     // ─── Chat History ───
     getChatHistory: (): ChatSession[] => {
         if (typeof window === "undefined") return [];
@@ -109,6 +126,7 @@ export interface ChatSession {
     messages: ChatMessage[];
     createdAt: number;
     updatedAt: number;
+    folder?: string;
 }
 
 export function createChatSession(title?: string): ChatSession {
