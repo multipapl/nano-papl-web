@@ -76,6 +76,7 @@ export class FalProvider implements ImageProvider {
 
     async generate(params: GenerationParams): Promise<GenerationResult> {
         const start = performance.now();
+        const inputImages = params.inputImages?.length ? params.inputImages : (params.inputImage ? [params.inputImage] : []);
 
         const model = getModel(this.modelId);
         if (!model?.fal) {
@@ -87,7 +88,7 @@ export class FalProvider implements ImageProvider {
         }
 
         // Pick endpoint: use edit variant when we have an input image and the model supports it.
-        const hasInputImage = !!params.inputImage;
+        const hasInputImage = inputImages.length > 0;
         if (hasInputImage && !model.fal.endpointEdit && !model.capabilities.imageToImage) {
             return {
                 success: false,
@@ -104,16 +105,21 @@ export class FalProvider implements ImageProvider {
             // Makes Auto behaviour consistent across models (esp. FLUX.2, whose API
             // has no "auto" enum value) and predictable in Batch with mixed-ratio inputs.
             let effectiveAspectRatio = params.aspectRatio;
-            if (params.aspectRatio === "Auto" && params.inputImage) {
+            if (params.aspectRatio === "Auto" && inputImages.length > 0) {
                 try {
-                    const dims = await detectImageDimensions(params.inputImage);
+                    const dims = await detectImageDimensions(inputImages[0]);
                     effectiveAspectRatio = findClosestRatio(dims.width, dims.height);
                 } catch {
                     // Detection failed — leave as "Auto"; buildInput handles per-model fallback.
                 }
             }
 
-            const resolvedParams = { ...params, aspectRatio: effectiveAspectRatio };
+            const resolvedParams = {
+                ...params,
+                inputImage: inputImages[0] || "",
+                inputImages,
+                aspectRatio: effectiveAspectRatio,
+            };
             const size = resolutionToSize(params.resolution, effectiveAspectRatio);
             const input = model.fal.buildInput(resolvedParams, size);
 

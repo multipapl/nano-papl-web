@@ -60,23 +60,22 @@ export async function sendGeminiMessage(
     apiKey: string,
     messages: ChatMessage[],
     userText: string,
-    userImageBase64: string | null,
+    userImagesBase64: string[],
     config: GeminiConfig,
     systemInstruction?: string,
 ): Promise<GeminiResponse> {
     // Build user content parts
     const userParts: GeminiPart[] = [];
-    if (userText) {
-        userParts.push({ text: userText });
-    }
-    if (userImageBase64) {
-        // Extract mime and data from data URL
+    for (const userImageBase64 of userImagesBase64) {
         const match = userImageBase64.match(/^data:(.+?);base64,(.+)$/);
         if (match) {
             userParts.push({
                 inlineData: { mimeType: match[1], data: match[2] },
             });
         }
+    }
+    if (userText) {
+        userParts.push({ text: userText });
     }
 
     // Build full contents array (history + current message)

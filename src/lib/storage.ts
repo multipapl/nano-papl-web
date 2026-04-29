@@ -84,13 +84,14 @@ export const storage = {
         } catch { return []; }
     },
     saveChatHistory: (sessions: ChatSession[]) => {
-        // Strip base64 imageData before saving to localStorage (too large).
-        // Mark with "[image]" so we know to look up the real data in IndexedDB.
+        // Strip base64 image data before saving to localStorage (too large).
+        // Keep placeholders so we know to rehydrate from IndexedDB on load.
         const stripped = sessions.map(s => ({
             ...s,
             messages: s.messages.map(m => ({
                 ...m,
-                imageData: (m.imageData && m.imageData !== "[image]") ? "[image]" : m.imageData,
+                imageData: ((m.imageData && m.imageData !== "[image]") || (m.attachments?.length ?? 0) > 0) ? "[image]" : m.imageData,
+                attachments: m.attachments?.map(() => "[image]"),
             })),
         }));
         try {
@@ -116,7 +117,8 @@ export interface ChatMessage {
     id: string;
     role: "user" | "model";
     text: string;
-    imageData?: string; // base64 data URL
+    imageData?: string; // legacy single-image field / first attachment
+    attachments?: string[]; // base64 data URLs
     timestamp: number;
 }
 
@@ -139,12 +141,14 @@ export function createChatSession(title?: string): ChatSession {
     };
 }
 
-export function createMessage(role: "user" | "model", text: string, imageData?: string): ChatMessage {
+export function createMessage(role: "user" | "model", text: string, images?: string[]): ChatMessage {
+    const attachments = images?.filter(Boolean);
     return {
         id: crypto.randomUUID(),
         role,
         text,
-        imageData,
+        imageData: attachments?.[0],
+        attachments: attachments?.length ? attachments : undefined,
         timestamp: Date.now(),
     };
 }

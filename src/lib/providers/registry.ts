@@ -15,6 +15,13 @@ function normalizeAspect(aspectRatio: string): string | undefined {
     return aspectRatio === "Auto" ? "auto" : aspectRatio;
 }
 
+function getInputImages(params: GenerationParams): string[] {
+    if (params.inputImages?.length) {
+        return params.inputImages;
+    }
+    return params.inputImage ? [params.inputImage] : [];
+}
+
 // ─── Provider definitions ───
 
 export const PROVIDERS: ProviderDefinition[] = [
@@ -86,8 +93,9 @@ export const PROVIDERS: ProviderDefinition[] = [
                         } else {
                             input.image_size = { width: size.width, height: size.height };
                         }
-                        if (params.inputImage) {
-                            input.image_urls = [params.inputImage];
+                        const inputImages = getInputImages(params);
+                        if (inputImages.length > 0) {
+                            input.image_urls = inputImages;
                         }
                         if (params.providerParams?.seed != null) {
                             input.seed = params.providerParams.seed;
@@ -119,8 +127,9 @@ export const PROVIDERS: ProviderDefinition[] = [
                         if (ratio) {
                             input.aspect_ratio = ratio;
                         }
-                        if (params.inputImage) {
-                            input.image_urls = [params.inputImage];
+                        const inputImages = getInputImages(params);
+                        if (inputImages.length > 0) {
+                            input.image_urls = inputImages;
                         }
                         return input;
                     },

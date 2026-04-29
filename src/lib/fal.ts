@@ -25,17 +25,18 @@ export interface FalResponse {
 export async function sendFalMessage(
     apiKey: string,
     userText: string,
-    userImageBase64: string | null,
+    userImagesBase64: string[],
     config: FalChatConfig,
 ): Promise<FalResponse> {
-    if (!userText && !userImageBase64) {
+    if (!userText && userImagesBase64.length === 0) {
         return { text: "", error: "Please provide a prompt or an image." };
     }
 
     const provider = new FalProvider(apiKey, config.model);
     const result = await provider.generate({
         prompt: userText || "Generate an image",
-        inputImage: userImageBase64 || "",
+        inputImage: userImagesBase64[0] || "",
+        inputImages: userImagesBase64,
         resolution: config.resolution,
         aspectRatio: config.ratio,
     });

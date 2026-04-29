@@ -95,6 +95,9 @@ const CHAT_FOLDERS_KEY = "chat_folders";
 const CHAT_GALLERY_FOLDER_KEY = "chat_gallery_default_folder";
 const GALLERY_CUSTOM_FOLDERS_KEY = "gallery_custom_folders";
 const GALLERY_FOLDERS_CHANGED_EVENT = "nanopapl:gallery-folders-changed";
+const IMAGE_PLACEHOLDER = "[image]";
+const CHAT_ATTACHMENT_LIMIT = 3;
+const CHAT_TEXTAREA_MAX_HEIGHT = 180;
 
 function readStringListSetting(name: string): string[] {
     try {
@@ -112,6 +115,24 @@ function writeStringListSetting(name: string, values: string[]): void {
 
 function notifyGalleryFoldersChanged(): void {
     window.dispatchEvent(new CustomEvent(GALLERY_FOLDERS_CHANGED_EVENT));
+}
+
+function getMessageImages(message: ChatMessage): string[] {
+    if (message.attachments?.length) {
+        return message.attachments.filter((img): img is string => !!img && img !== IMAGE_PLACEHOLDER);
+    }
+    if (message.imageData && message.imageData !== IMAGE_PLACEHOLDER) {
+        return [message.imageData];
+    }
+    return [];
+}
+
+function hasStoredMessageImages(message: ChatMessage): boolean {
+    return !!message.imageData || (message.attachments?.length ?? 0) > 0;
+}
+
+function needsImageHydration(message: ChatMessage): boolean {
+    return message.imageData === IMAGE_PLACEHOLDER || message.attachments?.some((img) => img === IMAGE_PLACEHOLDER) || false;
 }
 
 type CapabilityBadgeType = "IMG2IMG" | "TXT2IMG" | "CHAT";
@@ -270,7 +291,7 @@ function ChatPage() {
     const [sessions, setSessions] = useState<ChatSession[]>([]);
     const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
     const [inputText, setInputText] = useState("");
-    const [attachedImage, setAttachedImage] = useState<string | null>(null);
+    const [attachedImages, setAttachedImages] = useState<string[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [activeProvider, setActiveProvider] = useState<ProviderSlug>("gemini");
@@ -282,8 +303,11 @@ function ChatPage() {
     const [aspectRatio, setAspectRatio] = useState<string>("16:9");
     const [showRatioPicker, setShowRatioPicker] = useState(false);
     const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+    const [isDraggingFiles, setIsDraggingFiles] = useState(false);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const dragCounterRef = useRef(0);
     const abortRef = useRef(false);
     const [chatFolders, setChatFolders] = useState<string[]>([]);
     const [expandedChatFolders, setExpandedChatFolders] = useState<Set<string>>(new Set(["Ungrouped"]));
@@ -314,9 +338,9 @@ function ChatPage() {
             setSessions(saved);
             setActiveSessionId(saved[0].id);
 
-            // Collect all message IDs that had images (marked as "[image]")
+            // Collect all message IDs that had images stored in IndexedDB.
             const imageMessageIds = saved.flatMap(s =>
-                s.messages.filter(m => m.imageData === "[image]").map(m => m.id)
+                s.messages.filter(needsImageHydration).map(m => m.id)
             );
             if (imageMessageIds.length > 0) {
                 loadImages(imageMessageIds).then(imageMap => {
@@ -324,8 +348,8 @@ function ChatPage() {
                     setSessions(prev => prev.map(s => ({
                         ...s,
                         messages: s.messages.map(m =>
-                            m.imageData === "[image]" && imageMap[m.id]
-                                ? { ...m, imageData: imageMap[m.id] }
+                            imageMap[m.id]
+                                ? { ...m, imageData: imageMap[m.id][0], attachments: imageMap[m.id] }
                                 : m
                         ),
                     })));
@@ -348,6 +372,15 @@ function ChatPage() {
             window.removeEventListener(GALLERY_FOLDERS_CHANGED_EVENT, handler);
         };
     }, [refreshGalleryFolders]);
+
+    useEffect(() => {
+        const textarea = textareaRef.current;
+        if (!textarea) return;
+        textarea.style.height = "0px";
+        const nextHeight = Math.min(textarea.scrollHeight, CHAT_TEXTAREA_MAX_HEIGHT);
+        textarea.style.height = `${nextHeight}px`;
+        textarea.style.overflowY = textarea.scrollHeight > CHAT_TEXTAREA_MAX_HEIGHT ? "auto" : "hidden";
+    }, [inputText]);
 
     // Auto-scroll to bottom when messages change
     useEffect(() => {
@@ -373,8 +406,7 @@ function ChatPage() {
         // Clean up images from IndexedDB for deleted session
         const session = sessions.find(s => s.id === id);
         if (session) {
-            // Also include "[image]" markers (persisted in IndexedDB but not yet hydrated)
-            const allImgIds = session.messages.filter(m => m.imageData).map(m => m.id);
+            const allImgIds = session.messages.filter(hasStoredMessageImages).map(m => m.id);
             deleteImages(allImgIds).catch(err => console.warn("Failed to delete images from IndexedDB:", err));
         }
         const updated = sessions.filter((s) => s.id !== id);
@@ -455,7 +487,7 @@ function ChatPage() {
     }, [sessions, chatFolders]);
 
     const handleSend = async () => {
-        if ((!inputText.trim() && !attachedImage) || isLoading) return;
+        if ((!inputText.trim() && attachedImages.length === 0) || isLoading) return;
 
         const apiKey = getApiKeyForProvider(activeProvider);
         if (!apiKey) {
@@ -474,7 +506,7 @@ function ChatPage() {
         }
 
         // Add user message
-        const userMsg = createMessage("user", inputText, attachedImage || undefined);
+        const userMsg = createMessage("user", inputText, attachedImages);
         session = {
             ...session,
             messages: [...session.messages, userMsg],
@@ -484,16 +516,16 @@ function ChatPage() {
         currentSessions = currentSessions.map((s) => (s.id === session!.id ? session! : s));
         persistSessions(currentSessions);
 
-        // Save user's attached image to IndexedDB
-        if (attachedImage) {
-            saveImage(userMsg.id, attachedImage).catch(err =>
-                console.warn("Failed to save user image to IndexedDB:", err));
+        // Save user attachments to IndexedDB
+        if (attachedImages.length > 0) {
+            saveImage(userMsg.id, attachedImages).catch(err =>
+                console.warn("Failed to save user images to IndexedDB:", err));
         }
 
         const messageText = inputText;
-        const messageImage = attachedImage;
+        const messageImages = attachedImages;
         setInputText("");
-        setAttachedImage(null);
+        setAttachedImages([]);
         setIsLoading(true);
         setError(null);
         abortRef.current = false;
@@ -509,7 +541,7 @@ function ChatPage() {
                     resolution: resolution,
                     ratio: aspectRatio,
                 };
-                response = await sendFalMessage(apiKey, messageText, messageImage, falConfig);
+                response = await sendFalMessage(apiKey, messageText, messageImages, falConfig);
             } else {
                 // Gemini path (default)
                 // If genImage is off, force flash model (text-only)
@@ -526,7 +558,7 @@ function ChatPage() {
                     apiKey,
                     session.messages.slice(0, -1),
                     messageText,
-                    messageImage,
+                    messageImages,
                     config,
                 );
             }
@@ -539,7 +571,8 @@ function ChatPage() {
             }
 
             // Add model response
-            const modelMsg = createMessage("model", response.text, response.imageData);
+            const modelImages = response.imageData ? [response.imageData] : undefined;
+            const modelMsg = createMessage("model", response.text, modelImages);
             const updatedSession = {
                 ...session,
                 messages: [...session.messages, modelMsg],
@@ -550,7 +583,7 @@ function ChatPage() {
 
             // Save model's generated image to IndexedDB
             if (response.imageData) {
-                saveImage(modelMsg.id, response.imageData).catch(err =>
+                saveImage(modelMsg.id, [response.imageData]).catch(err =>
                     console.warn("Failed to save model image to IndexedDB:", err));
 
                 // Also save to gallery
@@ -574,15 +607,38 @@ function ChatPage() {
         }
     };
 
-    const handleFileAttach = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0];
-        if (!file) return;
-        try {
-            const base64 = await fileToBase64(file);
-            setAttachedImage(base64);
-        } catch {
-            setError("Failed to read image file");
+    const appendImageFiles = useCallback(async (files: File[]) => {
+        const imageFiles = files.filter((file) => file.type.startsWith("image/"));
+        if (imageFiles.length === 0) {
+            setError("Only image files can be attached in chat");
+            return;
         }
+
+        const remainingSlots = CHAT_ATTACHMENT_LIMIT - attachedImages.length;
+        const filesToRead = imageFiles.slice(0, Math.max(remainingSlots, 0));
+
+        if (remainingSlots <= 0) {
+            setError(`You can attach up to ${CHAT_ATTACHMENT_LIMIT} images in chat.`);
+            return;
+        }
+
+        try {
+            const base64Images = await Promise.all(filesToRead.map(fileToBase64));
+            setAttachedImages((prev) => [...prev, ...base64Images]);
+            if (files.length > imageFiles.length) {
+                setError("Some dropped files were ignored because they are not images.");
+            } else if (imageFiles.length > filesToRead.length) {
+                setError(`Only the first ${CHAT_ATTACHMENT_LIMIT} images are kept in chat.`);
+            }
+        } catch {
+            setError("Failed to read one or more image files");
+        }
+    }, [attachedImages.length]);
+
+    const handleFileAttach = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const files = Array.from(e.target.files || []);
+        if (files.length === 0) return;
+        await appendImageFiles(files);
         // Reset input so same file can be selected again
         e.target.value = "";
     };
@@ -590,6 +646,41 @@ function ChatPage() {
     const handleStop = () => {
         abortRef.current = true;
         setIsLoading(false);
+    };
+
+    const handleComposerDragEnter = (e: React.DragEvent<HTMLDivElement>) => {
+        if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+        e.preventDefault();
+        dragCounterRef.current += 1;
+        setIsDraggingFiles(true);
+    };
+
+    const handleComposerDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+        if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+        if (!isDraggingFiles) {
+            setIsDraggingFiles(true);
+        }
+    };
+
+    const handleComposerDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+        if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+        e.preventDefault();
+        dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+        if (dragCounterRef.current === 0) {
+            setIsDraggingFiles(false);
+        }
+    };
+
+    const handleComposerDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+        if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+        e.preventDefault();
+        dragCounterRef.current = 0;
+        setIsDraggingFiles(false);
+        const files = Array.from(e.dataTransfer.files || []);
+        if (files.length === 0) return;
+        await appendImageFiles(files);
     };
 
     return (
@@ -728,12 +819,31 @@ function ChatPage() {
                     )}
 
                     {/* Attached image preview */}
-                    {attachedImage && (
+                    {attachedImages.length > 0 && (
                         <div className="mx-2 mb-2 max-w-3xl self-center w-full">
-                            <div className="inline-flex items-center gap-2 bg-muted rounded-lg p-2 pr-3">
-                                <img src={attachedImage} alt="attached" className="h-12 w-12 object-cover rounded" />
-                                <span className="text-xs text-muted-foreground">Image attached</span>
-                                <button onClick={() => setAttachedImage(null)} className="text-muted-foreground hover:text-foreground transition-colors"><X size={12} /></button>
+                            <div className="rounded-xl bg-muted p-2.5">
+                                <div className="mb-2 flex items-center justify-between">
+                                    <span className="text-xs text-muted-foreground">
+                                        {attachedImages.length} image{attachedImages.length !== 1 ? "s" : ""} attached
+                                    </span>
+                                    <span className="text-[10px] text-muted-foreground/50">
+                                        {attachedImages.length}/{CHAT_ATTACHMENT_LIMIT}
+                                    </span>
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                    {attachedImages.map((image, index) => (
+                                        <div key={`${index}-${image.slice(0, 32)}`} className="relative">
+                                            <img src={image} alt={`attachment ${index + 1}`} className="h-16 w-16 rounded-lg object-cover" />
+                                            <button
+                                                onClick={() => setAttachedImages((prev) => prev.filter((_, imgIndex) => imgIndex !== index))}
+                                                className="absolute -top-1.5 -right-1.5 rounded-full bg-black/70 p-1 text-white transition-colors hover:bg-black"
+                                                title="Remove image"
+                                            >
+                                                <X size={10} />
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
                             </div>
                         </div>
                     )}
@@ -741,16 +851,36 @@ function ChatPage() {
                     {/* Input */}
                     <div className="border-t border-border pt-3 pb-3 px-2">
                         <div className="max-w-3xl mx-auto">
-                            <div className="flex items-center gap-2">
-                                <div className="flex-1 flex items-center bg-muted rounded-xl px-4 py-2.5 transition-all duration-200 focus-within:ring-2 focus-within:ring-accent/30">
-                                    <input type="text" placeholder="Type a message..." value={inputText}
+                            <div className="flex items-end gap-2">
+                                <div
+                                    onDragEnter={handleComposerDragEnter}
+                                    onDragOver={handleComposerDragOver}
+                                    onDragLeave={handleComposerDragLeave}
+                                    onDrop={handleComposerDrop}
+                                    className={`flex-1 flex items-end rounded-xl border px-4 py-2.5 transition-all duration-200 focus-within:ring-2 focus-within:ring-accent/30 ${
+                                        isDraggingFiles
+                                            ? "bg-accent/10 ring-2 ring-accent/40 border border-accent/30"
+                                            : "bg-muted border-transparent"
+                                    }`}
+                                >
+                                    <textarea
+                                        ref={textareaRef}
+                                        placeholder={isDraggingFiles ? "Drop images here..." : "Type a message..."}
+                                        value={inputText}
                                         onChange={(e) => setInputText(e.target.value)}
                                         onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
-                                        className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/40" />
-                                    <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileAttach} />
-                                    <Tooltip label="Attach an image for the model to analyze or edit.">
+                                        rows={1}
+                                        className="max-h-[180px] min-h-[24px] flex-1 resize-none bg-transparent text-sm leading-6 outline-none placeholder:text-muted-foreground/40"
+                                    />
+                                    {isDraggingFiles && (
+                                        <span className="ml-2 text-[10px] font-medium uppercase tracking-wide text-accent/80">
+                                            Drop up to {CHAT_ATTACHMENT_LIMIT} images
+                                        </span>
+                                    )}
+                                    <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={handleFileAttach} />
+                                    <Tooltip label={`Attach up to ${CHAT_ATTACHMENT_LIMIT} reference images for the model to analyze or edit.`}>
                                         <button onClick={() => fileInputRef.current?.click()}
-                                            className="text-muted-foreground hover:text-foreground ml-2 transition-colors duration-200" title="Attach image">
+                                            className="ml-2 text-muted-foreground transition-colors duration-200 hover:text-foreground" title="Attach image">
                                             <Paperclip size={18} />
                                         </button>
                                     </Tooltip>
@@ -764,7 +894,7 @@ function ChatPage() {
                                 ) : (
                                     <Tooltip label={genImage ? "Send the prompt and generate an image." : "Send the message to chat."}>
                                         <button onClick={handleSend}
-                                            disabled={!inputText.trim() && !attachedImage}
+                                            disabled={!inputText.trim() && attachedImages.length === 0}
                                             className="p-2.5 rounded-xl bg-accent text-white hover:bg-accent-hover transition-all duration-200 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed">
                                             <Send size={16} />
                                         </button>
@@ -1059,6 +1189,8 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
 
 function ChatBubble({ message, onImageClick }: { message: ChatMessage; onImageClick?: (src: string) => void }) {
     const isUser = message.role === "user";
+    const images = getMessageImages(message);
+    const hasPendingImagePlaceholder = images.length === 0 && needsImageHydration(message);
 
     return (
         <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
@@ -1068,18 +1200,22 @@ function ChatBubble({ message, onImageClick }: { message: ChatMessage; onImageCl
                 {message.text && (
                     <p className={`text-sm whitespace-pre-wrap leading-relaxed ${isUser ? "text-user-bubble-text" : "text-foreground"}`}>{message.text}</p>
                 )}
-                {message.imageData && message.imageData !== "[image]" && (
-                    <div className="mt-2 relative group">
-                        <img src={message.imageData} alt="Generated"
-                            className="rounded-lg max-h-80 w-auto cursor-pointer hover:brightness-110 transition-all duration-200"
-                            onClick={() => onImageClick?.(message.imageData!)} />
-                        <button onClick={() => downloadBase64Image(message.imageData!, `nanopapl_${new Date(message.timestamp).toISOString().slice(0, 10)}_${message.id.slice(0, 6)}.png`)}
-                            className="absolute top-2 right-2 p-1.5 bg-black/50 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 hover:bg-black/70">
-                            <Download size={14} className="text-white" />
-                        </button>
+                {images.length > 0 && (
+                    <div className={`mt-2 grid gap-2 ${images.length > 1 ? "grid-cols-2" : "grid-cols-1"}`}>
+                        {images.map((image, index) => (
+                            <div key={`${message.id}-${index}`} className="relative group">
+                                <img src={image} alt={`Attachment ${index + 1}`}
+                                    className="rounded-lg max-h-80 w-auto cursor-pointer hover:brightness-110 transition-all duration-200"
+                                    onClick={() => onImageClick?.(image)} />
+                                <button onClick={() => downloadBase64Image(image, `nanopapl_${new Date(message.timestamp).toISOString().slice(0, 10)}_${message.id.slice(0, 6)}_${index + 1}.png`)}
+                                    className="absolute top-2 right-2 p-1.5 bg-black/50 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 hover:bg-black/70">
+                                    <Download size={14} className="text-white" />
+                                </button>
+                            </div>
+                        ))}
                     </div>
                 )}
-                {message.imageData === "[image]" && (
+                {hasPendingImagePlaceholder && (
                     <p className="mt-1 text-xs text-muted-foreground/50 italic">🖼 Image (not saved in history)</p>
                 )}
                 <p className={`text-[9px] mt-1 ${isUser ? "text-user-bubble-text/40" : "text-muted-foreground/40"}`}>
@@ -2025,7 +2161,7 @@ function SettingsPage() {
             const validIds = new Set<string>();
             for (const s of sessions) {
                 for (const m of s.messages) {
-                    if (m.imageData) validIds.add(m.id);
+                    if (hasStoredMessageImages(m)) validIds.add(m.id);
                 }
             }
             const removed = await cleanOrphanedImages(validIds);

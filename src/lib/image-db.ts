@@ -52,33 +52,48 @@ function openDB(): Promise<IDBDatabase> {
 // ═══════════════════════════════════════
 
 /** Save a single image (base64 data URL) keyed by message ID. */
-export async function saveImage(messageId: string, dataUrl: string): Promise<void> {
+function normalizeStoredImages(value: unknown): string[] {
+    if (Array.isArray(value)) {
+        return value.filter((item): item is string => typeof item === "string" && item.length > 0);
+    }
+    if (typeof value === "string" && value.length > 0) {
+        return [value];
+    }
+    return [];
+}
+
+export async function saveImage(messageId: string, dataUrl: string | string[]): Promise<void> {
+    const images = normalizeStoredImages(dataUrl);
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, "readwrite");
-        tx.objectStore(STORE_NAME).put(dataUrl, messageId);
+        tx.objectStore(STORE_NAME).put(images, messageId);
         tx.oncomplete = () => { db.close(); resolve(); };
         tx.onerror = () => { db.close(); reject(tx.error); };
     });
 }
 
 /** Load a single image by message ID. Returns null if not found. */
-export async function loadImage(messageId: string): Promise<string | null> {
+export async function loadImage(messageId: string): Promise<string[] | null> {
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, "readonly");
         const req = tx.objectStore(STORE_NAME).get(messageId);
-        req.onsuccess = () => { db.close(); resolve(req.result ?? null); };
+        req.onsuccess = () => {
+            db.close();
+            const images = normalizeStoredImages(req.result);
+            resolve(images.length > 0 ? images : null);
+        };
         req.onerror = () => { db.close(); reject(req.error); };
     });
 }
 
 /** Load multiple images by their message IDs. Returns a map of id → dataUrl. */
-export async function loadImages(messageIds: string[]): Promise<Record<string, string>> {
+export async function loadImages(messageIds: string[]): Promise<Record<string, string[]>> {
     if (messageIds.length === 0) return {};
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const result: Record<string, string> = {};
+        const result: Record<string, string[]> = {};
         const tx = db.transaction(STORE_NAME, "readonly");
         const store = tx.objectStore(STORE_NAME);
         let pending = messageIds.length;
@@ -86,7 +101,8 @@ export async function loadImages(messageIds: string[]): Promise<Record<string, s
         for (const id of messageIds) {
             const req = store.get(id);
             req.onsuccess = () => {
-                if (req.result) result[id] = req.result;
+                const images = normalizeStoredImages(req.result);
+                if (images.length > 0) result[id] = images;
                 pending--;
                 if (pending === 0) { db.close(); resolve(result); }
             };
@@ -316,6 +332,8 @@ async function estimateStoreSize(storeName: string): Promise<StoreSizeInfo> {
                 const val = cursor.value;
                 if (typeof val === "string") {
                     bytes += val.length * 2; // UTF-16
+                } else if (Array.isArray(val)) {
+                    bytes += val.reduce((total, item) => total + (typeof item === "string" ? item.length * 2 : 0), 0);
                 } else if (val && typeof val === "object") {
                     // Gallery items: mainly the dataUrl field
                     const item = val as GalleryItem;

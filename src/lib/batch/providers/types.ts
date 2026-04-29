@@ -6,6 +6,7 @@
 export interface GenerationParams {
     prompt: string;
     inputImage: string; // base64 data URL
+    inputImages?: string[]; // optional multi-reference inputs for chat/edit flows
     resolution: string; // "1K" | "2K" | "4K"
     aspectRatio: string; // "16:9" | "1:1" | "Auto" | etc.
     /** Provider-specific extra parameters (e.g. strength, guidance_scale for fal.ai). */
