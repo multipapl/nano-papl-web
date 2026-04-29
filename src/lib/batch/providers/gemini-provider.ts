@@ -1,44 +1,54 @@
 /**
  * Gemini image generation provider.
- * Wraps the existing /api/gemini proxy route to conform to ImageProvider interface.
+ * Uses the direct Gemini Files API + generateContent flow without the Vercel proxy.
  */
 
 import type { ImageProvider, GenerationParams, GenerationResult } from "./types";
-import { assertSafePayloadSize } from "@/lib/payload-limits";
+import {
+    requestGeminiContent,
+    uploadGeminiDataUrl,
+    type GeminiUploadedFile,
+} from "@/lib/gemini";
 
 export class GeminiProvider implements ImageProvider {
     readonly name = "Google Gemini";
     private apiKey: string;
     private modelId: string;
+    private uploadCache = new Map<string, Promise<GeminiUploadedFile>>();
 
     constructor(apiKey: string, modelId = "gemini-3-pro-image-preview") {
         this.apiKey = apiKey;
         this.modelId = modelId;
     }
 
+    private getUploadedFile(dataUrl: string): Promise<GeminiUploadedFile> {
+        const cached = this.uploadCache.get(dataUrl);
+        if (cached) return cached;
+
+        const upload = uploadGeminiDataUrl(this.apiKey, dataUrl, "batch-input");
+        this.uploadCache.set(dataUrl, upload);
+        return upload;
+    }
+
     async generate(params: GenerationParams): Promise<GenerationResult> {
         const start = performance.now();
 
         try {
-            // Extract raw base64 from data URL
-            const match = params.inputImage.match(/^data:(.+?);base64,(.+)$/);
-            if (!match) {
-                return { success: false, error: "Invalid input image format" };
+            if (!params.inputImage) {
+                return { success: false, error: "Gemini batch generation requires an input image" };
             }
-            const [, mimeType, imageData] = match;
 
-            // Build contents for Gemini API
+            const uploadedFile = await this.getUploadedFile(params.inputImage);
             const contents = [
                 {
-                    role: "user",
+                    role: "user" as const,
                     parts: [
+                        { fileData: { mimeType: uploadedFile.mimeType, fileUri: uploadedFile.uri } },
                         { text: params.prompt },
-                        { inlineData: { mimeType, data: imageData } },
                     ],
                 },
             ];
 
-            // Image config
             const imageConfig: Record<string, string> = {
                 imageSize: params.resolution,
             };
@@ -46,64 +56,23 @@ export class GeminiProvider implements ImageProvider {
                 imageConfig.aspectRatio = params.aspectRatio;
             }
 
-            // NOTE: signal is intentionally NOT passed to fetch() so that
-            // in-flight requests complete naturally. The batch engine checks
-            // signal.aborted between tasks to implement graceful stop.
-            const payload = JSON.stringify({
-                apiKey: this.apiKey,
+            const response = await requestGeminiContent(this.apiKey, {
                 modelId: this.modelId,
                 contents,
                 systemInstruction: "You are an architectural visualization AI. Generate the image exactly as described in the prompt. Do not add text overlays.",
                 responseModalities: ["TEXT", "IMAGE"],
                 imageConfig,
             });
-            assertSafePayloadSize(payload, "Gemini request");
 
-            const res = await fetch("/api/gemini", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: payload,
-            });
-
-            const data = await res.json();
-
-            if (!res.ok || data.error) {
+            if (response.error) {
                 return {
                     success: false,
-                    error: data.error || `API error: ${res.status}`,
+                    error: response.error,
                     metadata: { duration: performance.now() - start },
                 };
             }
 
-            // Parse response
-            const candidates = data.candidates || [];
-            if (candidates.length === 0) {
-                return {
-                    success: false,
-                    error: "No candidates in response",
-                    metadata: { duration: performance.now() - start },
-                };
-            }
-
-            const parts = candidates[0]?.content?.parts || [];
-            let resultImageData: string | undefined;
-
-            for (const part of parts) {
-                if (part.inlineData) {
-                    resultImageData = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-                    break;
-                }
-            }
-
-            if (!resultImageData) {
-                const blockReason = candidates[0]?.finishReason;
-                if (blockReason && blockReason !== "STOP") {
-                    return {
-                        success: false,
-                        error: `Response blocked: ${blockReason}`,
-                        metadata: { duration: performance.now() - start },
-                    };
-                }
+            if (!response.imageData) {
                 return {
                     success: false,
                     error: "No image in response",
@@ -113,10 +82,10 @@ export class GeminiProvider implements ImageProvider {
 
             return {
                 success: true,
-                imageDataUrl: resultImageData,
+                imageDataUrl: response.imageData,
                 metadata: {
                     duration: performance.now() - start,
-                    format: resultImageData.startsWith("data:image/png") ? "PNG" : "JPG",
+                    format: response.imageData.startsWith("data:image/png") ? "PNG" : "JPG",
                 },
             };
         } catch (err: unknown) {

@@ -5,9 +5,10 @@
  */
 
 import type { ImageProvider, GenerationParams, GenerationResult } from "./types";
+import { fal } from "@fal-ai/client";
 import { getModel } from "@/lib/providers/registry";
 import type { ImageSize } from "@/lib/providers/types";
-import { assertSafePayloadSize } from "@/lib/payload-limits";
+import { blobToDataUrl, dataUrlToBlob } from "@/lib/data-url";
 
 /**
  * Map resolution string ("1K", "2K", "4K") to pixel dimensions for fal models
@@ -68,15 +69,29 @@ export class FalProvider implements ImageProvider {
     readonly name = "Fal.ai";
     private apiKey: string;
     private modelId: string;
+    private uploadCache = new Map<string, Promise<string>>();
 
     constructor(apiKey: string, modelId: string) {
         this.apiKey = apiKey;
         this.modelId = modelId;
     }
 
+    private uploadInputImage(dataUrl: string): Promise<string> {
+        const cached = this.uploadCache.get(dataUrl);
+        if (cached) return cached;
+
+        const upload = (async () => {
+            fal.config({ credentials: this.apiKey });
+            return fal.storage.upload(dataUrlToBlob(dataUrl));
+        })();
+
+        this.uploadCache.set(dataUrl, upload);
+        return upload;
+    }
+
     async generate(params: GenerationParams): Promise<GenerationResult> {
         const start = performance.now();
-        const inputImages = params.inputImages?.length ? params.inputImages : (params.inputImage ? [params.inputImage] : []);
+        const localInputImages = params.inputImages?.length ? params.inputImages : (params.inputImage ? [params.inputImage] : []);
 
         const model = getModel(this.modelId);
         if (!model?.fal) {
@@ -88,7 +103,7 @@ export class FalProvider implements ImageProvider {
         }
 
         // Pick endpoint: use edit variant when we have an input image and the model supports it.
-        const hasInputImage = inputImages.length > 0;
+        const hasInputImage = localInputImages.length > 0;
         if (hasInputImage && !model.fal.endpointEdit && !model.capabilities.imageToImage) {
             return {
                 success: false,
@@ -105,35 +120,33 @@ export class FalProvider implements ImageProvider {
             // Makes Auto behaviour consistent across models (esp. FLUX.2, whose API
             // has no "auto" enum value) and predictable in Batch with mixed-ratio inputs.
             let effectiveAspectRatio = params.aspectRatio;
-            if (params.aspectRatio === "Auto" && inputImages.length > 0) {
+            if (params.aspectRatio === "Auto" && localInputImages.length > 0) {
                 try {
-                    const dims = await detectImageDimensions(inputImages[0]);
+                    const dims = await detectImageDimensions(localInputImages[0]);
                     effectiveAspectRatio = findClosestRatio(dims.width, dims.height);
                 } catch {
                     // Detection failed — leave as "Auto"; buildInput handles per-model fallback.
                 }
             }
 
+            const uploadedInputImages = await Promise.all(localInputImages.map((image) => this.uploadInputImage(image)));
+
             const resolvedParams = {
                 ...params,
-                inputImage: inputImages[0] || "",
-                inputImages,
+                inputImage: uploadedInputImages[0] || "",
+                inputImages: uploadedInputImages,
                 aspectRatio: effectiveAspectRatio,
             };
             const size = resolutionToSize(params.resolution, effectiveAspectRatio);
             const input = model.fal.buildInput(resolvedParams, size);
 
-            const payload = JSON.stringify({
-                apiKey: this.apiKey,
-                modelId: endpoint,
-                input,
-            });
-            assertSafePayloadSize(payload, "Fal.ai request");
-
-            const res = await fetch("/api/fal", {
+            const res = await fetch(`https://fal.run/${endpoint}`, {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: payload,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Key ${this.apiKey}`,
+                },
+                body: JSON.stringify(input),
             });
 
             const data = await res.json();
@@ -141,7 +154,7 @@ export class FalProvider implements ImageProvider {
             if (!res.ok || data.error) {
                 return {
                     success: false,
-                    error: data.error || `Fal.ai API error: ${res.status}`,
+                    error: data.error || data.detail || data.message || `Fal.ai API error: ${res.status}`,
                     metadata: { duration: performance.now() - start },
                 };
             }
@@ -205,10 +218,5 @@ async function resolveToDataUrl(url: string): Promise<string> {
     if (url.startsWith("data:")) return url;
     const res = await fetch(url);
     const blob = await res.blob();
-    return new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-    });
+    return blobToDataUrl(blob);
 }

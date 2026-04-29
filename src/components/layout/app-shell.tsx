@@ -782,9 +782,15 @@ function ChatPage() {
                 </aside>
 
                 {/* Main chat area */}
-                <div className="flex-1 flex flex-col min-w-0">
+                <div
+                    className="relative flex-1 flex flex-col min-w-0"
+                    onDragEnter={handleComposerDragEnter}
+                    onDragOver={handleComposerDragOver}
+                    onDragLeave={handleComposerDragLeave}
+                    onDrop={handleComposerDrop}
+                >
                     {/* Messages */}
-                    <div className="flex-1 overflow-y-auto px-2">
+                    <div className={`flex-1 overflow-y-auto px-2 transition-all duration-200 ${isDraggingFiles ? "bg-accent/5" : ""}`}>
                         {activeSession && activeSession.messages.length > 0 ? (
                             <div className="flex flex-col gap-4 py-4 max-w-3xl mx-auto">
                                 {activeSession.messages.map((msg) => (
@@ -808,6 +814,16 @@ function ChatPage() {
                             </div>
                         )}
                     </div>
+                    {isDraggingFiles && (
+                        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center p-6">
+                            <div className="w-full max-w-2xl rounded-2xl border border-accent/40 bg-card/92 px-8 py-12 text-center shadow-2xl backdrop-blur-sm">
+                                <div className="text-sm font-medium text-foreground">Drop images into chat</div>
+                                <div className="mt-2 text-xs text-muted-foreground">
+                                    Up to {CHAT_ATTACHMENT_LIMIT} reference images will be attached to the next message
+                                </div>
+                            </div>
+                        </div>
+                    )}
 
                     {/* Error */}
                     {error && (
@@ -853,30 +869,17 @@ function ChatPage() {
                         <div className="max-w-3xl mx-auto">
                             <div className="flex items-end gap-2">
                                 <div
-                                    onDragEnter={handleComposerDragEnter}
-                                    onDragOver={handleComposerDragOver}
-                                    onDragLeave={handleComposerDragLeave}
-                                    onDrop={handleComposerDrop}
-                                    className={`flex-1 flex items-end rounded-xl border px-4 py-2.5 transition-all duration-200 focus-within:ring-2 focus-within:ring-accent/30 ${
-                                        isDraggingFiles
-                                            ? "bg-accent/10 ring-2 ring-accent/40 border border-accent/30"
-                                            : "bg-muted border-transparent"
-                                    }`}
+                                    className="flex-1 flex items-end rounded-xl border border-transparent bg-muted px-4 py-2.5 transition-all duration-200 focus-within:ring-2 focus-within:ring-accent/30"
                                 >
                                     <textarea
                                         ref={textareaRef}
-                                        placeholder={isDraggingFiles ? "Drop images here..." : "Type a message..."}
+                                        placeholder="Type a message..."
                                         value={inputText}
                                         onChange={(e) => setInputText(e.target.value)}
                                         onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
                                         rows={1}
                                         className="max-h-[180px] min-h-[24px] flex-1 resize-none bg-transparent text-sm leading-6 outline-none placeholder:text-muted-foreground/40"
                                     />
-                                    {isDraggingFiles && (
-                                        <span className="ml-2 text-[10px] font-medium uppercase tracking-wide text-accent/80">
-                                            Drop up to {CHAT_ATTACHMENT_LIMIT} images
-                                        </span>
-                                    )}
                                     <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={handleFileAttach} />
                                     <Tooltip label={`Attach up to ${CHAT_ATTACHMENT_LIMIT} reference images for the model to analyze or edit.`}>
                                         <button onClick={() => fileInputRef.current?.click()}
